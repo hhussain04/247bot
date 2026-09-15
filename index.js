@@ -15,6 +15,7 @@ import {
   VoiceConnectionStatus,
   entersState,
 } from '@discordjs/voice';
+import * as football from './football.js';
 
 // ---------- config ----------
 const TOKEN      = process.env.DISCORD_TOKEN;
@@ -57,7 +58,11 @@ const fmtDuration = (ms) => {
 
 // ---------- voice ----------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers, // privileged — enable Server Members Intent
+  ],
 });
 
 function connect() {
@@ -121,13 +126,27 @@ const commands = [
       .addChannelTypes(ChannelType.GuildVoice).setRequired(true)),
 ].map(c => c.toJSON());
 
+const allCommands = [...commands, ...football.commands];
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
-  log(`registered ${commands.length} slash commands`);
+  await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: allCommands });
+  log(`registered ${allCommands.length} slash commands (${football.commands.length} from football)`);
 }
 
 client.on('interactionCreate', async (i) => {
+  // football handles its own permission checks, and needs buttons and modals
+  // from ordinary members, so it runs before the owner gate below
+  try {
+    if (await football.handle(i)) return;
+  } catch (e) {
+    log(`football error: ${e.message}`);
+    if (!i.replied && !i.deferred) {
+      i.reply({ content: `Error: ${e.message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+    return;
+  }
+
   if (!i.isChatInputCommand()) return;
   if (i.user.id !== OWNER_ID) {
     return i.reply({ content: 'Not for you.', flags: MessageFlags.Ephemeral });
