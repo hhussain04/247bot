@@ -6,7 +6,7 @@
 //   if (await mod.handleMessage(message)) return;   // inside messageCreate
 
 import fs from 'node:fs';
-import { Colors, EmbedBuilder } from 'discord.js';
+import { Colors, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 
 const PREFIX = '-';
 
@@ -23,7 +23,9 @@ export const isSuper = (userId) => SUPER_IDS.has(userId);
 const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
-  'puppify', 'catify', 'forcenick', 'perms', 'removeperm',
+  'puppify', 'catify', 'forcenick', 'lock', 'unlock', 'invitedby',
+  'copychannelperms',
+  'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
   'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
 ];
@@ -42,6 +44,9 @@ const BUILTIN_ALIASES = {
   to: 'timeout',
   fn: 'forcenick',
   unfn: 'forcenick',
+  l: 'lock',
+  ul: 'unlock',
+  ccp: 'copychannelperms',
   commands: 'help',
 };
 
@@ -73,6 +78,8 @@ function guildState(guildId) {
   gs.aliases ??= {};
   gs.pets ??= {};
   gs.nicks ??= {};
+  gs.locks ??= {};
+  gs.invitedBy ??= {};
   return gs;
 }
 
@@ -154,6 +161,12 @@ function resolveRole(guild, text) {
 
   const partial = roles.filter((r) => r.name.toLowerCase().startsWith(lower));
   return partial.size === 1 ? partial.first() : null;
+}
+
+function resolveAnyRole(guild, text) {
+  const name = text?.trim().toLowerCase().replace(/^@/, '');
+  if (name === 'everyone') return guild.roles.everyone;
+  return resolveRole(guild, text);
 }
 
 function parseColor(input) {
@@ -281,6 +294,120 @@ async function setPet(message, args, sound, command) {
   return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
 }
 
+// ---------- channel lock ----------
+const SEND = PermissionFlagsBits.SendMessages;
+const SEND_THREADS = PermissionFlagsBits.SendMessagesInThreads;
+
+// true allowed, false denied, null not set.
+const valueOf = (overwrite, bit) => {
+  if (!overwrite) return null;
+  if (overwrite.allow.has(bit)) return true;
+  if (overwrite.deny.has(bit)) return false;
+  return null;
+};
+
+const previous = (overwrite) => ({
+  SendMessages: valueOf(overwrite, SEND),
+  SendMessagesInThreads: valueOf(overwrite, SEND_THREADS),
+});
+
+async function setLock(message, locking) {
+  const { channel, guild } = message;
+  const me = guild.members.me;
+  const gs = guildState(message.guildId);
+  const reason = `${locking ? 'lock' : 'unlock'} ${by(message)}`;
+
+  if (!channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageRoles)) {
+    return say(message, 'I need Manage Permissions in this channel.');
+  }
+
+  if (!locking) {
+    const saved = gs.locks[channel.id];
+    if (!saved) return say(message, "This channel isn't locked.");
+    for (const entry of saved) {
+      await channel.permissionOverwrites.edit(entry.id, entry.prev, { reason }).catch(() => {});
+    }
+    delete gs.locks[channel.id];
+    save();
+    return ok(message, 'Channel unlocked.');
+  }
+
+  if (gs.locks[channel.id]) return say(message, 'This channel is already locked.');
+
+  // @everyone, plus anything that is explicitly allowed to talk and isn't admin.
+  const targets = new Set([guild.roles.everyone.id]);
+  for (const overwrite of channel.permissionOverwrites.cache.values()) {
+    if (overwrite.id === me.id) continue;
+    if (!overwrite.allow.has(SEND) && !overwrite.allow.has(SEND_THREADS)) continue;
+
+    const role = guild.roles.cache.get(overwrite.id);
+    if (role) {
+      if (role.permissions.has(PermissionFlagsBits.Administrator)) continue;
+    } else {
+      const member = await guild.members.fetch(overwrite.id).catch(() => null);
+      if (member?.permissions.has(PermissionFlagsBits.Administrator)) continue;
+    }
+    targets.add(overwrite.id);
+  }
+
+  const changes = [];
+
+  // Keep myself able to talk so I can still reply and unlock.
+  changes.push({ id: me.id, prev: previous(channel.permissionOverwrites.cache.get(me.id)) });
+  await channel.permissionOverwrites.edit(
+    me.id, { SendMessages: true, SendMessagesInThreads: true }, { reason });
+
+  for (const id of targets) {
+    changes.push({ id, prev: previous(channel.permissionOverwrites.cache.get(id)) });
+    await channel.permissionOverwrites.edit(
+      id, { SendMessages: false, SendMessagesInThreads: false }, { reason });
+  }
+
+  gs.locks[channel.id] = changes;
+  save();
+  return ok(message, 'Channel locked. Anyone with Administrator can still talk.');
+}
+
+// ---------- invite tracking ----------
+// Invite uses are cached so a join can be matched to the code that went up.
+// Needs Manage Server.
+const inviteCache = new Map();
+
+const snapshot = (invites) => new Map(invites.map((i) =>
+  [i.code, { uses: i.uses ?? 0, inviterId: i.inviter?.id ?? null }]));
+
+async function cacheInvites(guild) {
+  const invites = await guild.invites.fetch().catch(() => null);
+  if (invites) inviteCache.set(guild.id, snapshot(invites));
+}
+
+async function findInviter(guild) {
+  const before = inviteCache.get(guild.id) ?? new Map();
+  const invites = await guild.invites.fetch().catch(() => null);
+  if (!invites) return null;
+
+  const after = snapshot(invites);
+  inviteCache.set(guild.id, after);
+
+  for (const [code, now] of after) {
+    if (now.uses > (before.get(code)?.uses ?? 0)) {
+      return { code, inviterId: now.inviterId, uses: now.uses };
+    }
+  }
+
+  // A one-use invite is deleted the moment it is used.
+  for (const [code, was] of before) {
+    if (!after.has(code)) {
+      return { code, inviterId: was.inviterId, uses: was.uses + 1 };
+    }
+  }
+
+  const vanity = await guild.fetchVanityData().catch(() => null);
+  return vanity?.code
+    ? { code: vanity.code, inviterId: null, uses: vanity.uses ?? 0 }
+    : null;
+}
+
 // ---------- welcome / goodbye ----------
 const GREETINGS = {
   welcome: { color: 0x57f287, text: 'welcome loser', label: 'Joined' },
@@ -331,7 +458,7 @@ async function bindGreeting(message, args, kind, mode) {
   return ok(message, `${kind === 'welcome' ? 'Welcome' : 'Goodbye'} messages will go to ${channel}.`);
 }
 
-async function sendGreeting(member, kind) {
+async function sendGreeting(member, kind, invite) {
   const channelId = own(state.guilds, member.guild.id)?.[kind];
   const channel = channelId ? member.guild.channels.cache.get(channelId) : null;
   if (!channel?.isTextBased()) return;
@@ -347,6 +474,14 @@ async function sendGreeting(member, kind) {
     .setThumbnail(member.displayAvatarURL({ size: 256 }))
     .addFields({ name: label, value: `<t:${unix}:F> (<t:${unix}:R>)` });
 
+  if (kind === 'welcome' && invite) {
+    embed.addFields({
+      name: 'Invited by',
+      value: `${invite.inviterId ? `<@${invite.inviterId}>` : 'vanity URL'}` +
+        ` (\`${invite.code}\`, ${invite.uses} uses)`,
+    });
+  }
+
   await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
 }
 
@@ -361,6 +496,65 @@ const HANDLERS = {
 
   puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
   catify: (message, args) => setPet(message, args, 'meow', 'catify'),
+
+  async invitedby(message, args) {
+    const id = idFrom(args[0]);
+    if (!id) return say(message, 'Usage: `-invitedby @user`');
+    const record = own(guildState(message.guildId).invitedBy, id);
+    if (!record) return say(message, `No invite recorded for <@${id}>.`);
+    return info(message, `<@${id}> joined with \`${record.code}\` from ` +
+      `${record.inviterId ? `<@${record.inviterId}>` : 'the vanity URL'}` +
+      ` <t:${Math.floor(record.at / 1000)}:R>`);
+  },
+
+  async copychannelperms(message, args) {
+    const { channel, guild } = message;
+    const from = resolveAnyRole(guild, args[0]);
+    const to = resolveAnyRole(guild, args[1]);
+    if (!from || !to) {
+      return say(message, 'Usage: `-copychannelperms @from @to`. Mention, ID, name or `everyone`.');
+    }
+    if (from.id === to.id) return say(message, "That's the same role twice.");
+
+    if (!channel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageRoles)) {
+      return say(message, 'I need Manage Permissions in this channel.');
+    }
+    if (to.managed) return say(message, `${to} is managed by an integration.`);
+    if (to.id !== guild.id && to.position >= guild.members.me.roles.highest.position) {
+      return say(message, `${to} is above my role. Drag my role higher.`);
+    }
+    if (
+      !isSuper(message.author.id) &&
+      message.author.id !== guild.ownerId &&
+      to.id !== guild.id &&
+      to.position >= message.member.roles.highest.position
+    ) {
+      return say(message, `${to} is above your top role.`);
+    }
+
+    const source = channel.permissionOverwrites.cache.get(from.id);
+    if (!source) return say(message, `${from} has no permissions set in this channel.`);
+
+    const options = {};
+    for (const name of source.allow.toArray()) options[name] = true;
+    for (const name of source.deny.toArray()) options[name] = false;
+
+    // Clear anything the target has that the source doesn't, so it's an exact copy.
+    const existing = channel.permissionOverwrites.cache.get(to.id);
+    if (existing) {
+      for (const name of [...existing.allow.toArray(), ...existing.deny.toArray()]) {
+        options[name] ??= null;
+      }
+    }
+
+    await channel.permissionOverwrites.edit(to.id, options, {
+      reason: `copy channel perms ${by(message)}`,
+    });
+    return ok(message, `Copied ${from}'s permissions in ${channel} to ${to}.`);
+  },
+
+  lock: (message) => setLock(message, true),
+  unlock: (message) => setLock(message, false),
 
   async forcenick(message, args) {
     const target = await resolveMember(message.guild, args[0]);
@@ -424,6 +618,8 @@ const HANDLERS = {
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
             '`-puppify @user` / `-catify @user` every word becomes bark / meow (again to undo)',
             '`-fn @user <nickname>` lock their nickname, `-unfn @user` release it',
+            '`-lock` / `-unlock` this channel, admins can still talk (`-l` / `-ul`)',
+            '`-copychannelperms @from @to` copy one role\'s channel permissions onto another (`-ccp`)',
           ].join('\n'),
         },
         {
@@ -439,6 +635,7 @@ const HANDLERS = {
           value: [
             '`-setwelcomechannel #channel`, `-changewelcomechannel #channel`, `-removewelcomebinding`',
             '`-setgoodbyechannel #channel`, `-changegoodbyechannel #channel`, `-removegoodbyebinding`',
+            '`-invitedby @user` which invite they joined with',
           ].join('\n'),
         },
         {
@@ -850,17 +1047,27 @@ export function attach(client) {
     enforce(member);
     enforceNick(member);
   });
-  client.on('guildMemberAdd', (member) => {
-    sendGreeting(member, 'welcome');
+  client.on('guildMemberAdd', async (member) => {
+    const invite = await findInviter(member.guild);
+    if (invite) {
+      guildState(member.guild.id).invitedBy[member.id] = { ...invite, at: Date.now() };
+      save();
+    }
+    sendGreeting(member, 'welcome', invite);
     setTimeout(() => enforce(member), 3_000);
     setTimeout(() => enforceNick(member), 3_000);
   });
+
+  client.on('inviteCreate', (invite) => { cacheInvites(invite.guild); });
+  client.on('inviteDelete', (invite) => { cacheInvites(invite.guild); });
+  client.on('guildCreate', (guild) => { cacheInvites(guild); });
   client.on('guildMemberRemove', (member) => { sendGreeting(member, 'goodbye'); });
 
   // Leave events only fire for cached members, so cache everyone on start.
   client.once('clientReady', () => {
     for (const guild of client.guilds.cache.values()) {
       guild.members.fetch().catch(() => {});
+      cacheInvites(guild);
     }
   });
 }
