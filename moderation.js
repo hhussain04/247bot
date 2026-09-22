@@ -25,6 +25,7 @@ const COMMANDS = [
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
   'copychannelperms', 'purge', 'bc', 'whitelist', 'unwhitelist',
+  'say', 'phrase',
   'snipe', 'editsnipe', 'reactionsnipe', 'clearsnipe', 'snipeperms',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
@@ -102,6 +103,7 @@ function guildState(guildId) {
   gs.invitedBy ??= {};
   gs.immune ??= {};
   gs.snipers ??= {};
+  gs.phrases ??= {};
   return gs;
 }
 
@@ -336,6 +338,41 @@ async function setPet(message, args, sound, command) {
   gs.pets[target.id] = sound;
   save();
   return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
+}
+
+// ---------- speaking as people ----------
+// Posts the text once as the target, or as everyone, then removes the command.
+async function speakOnce(message, args, content, command) {
+  const token = args[0]?.toLowerCase();
+  const all = message.mentions.everyone || token === '@everyone' || token === 'everyone';
+  const blocked = (id) =>
+    isImmune(id, message.guildId, command) || isImmune(id, message.guildId, 'say');
+
+  if (all) {
+    const members = [...message.guild.members.cache.values()]
+      .filter((m) => !m.user.bot && !isSuper(m.id) && !blocked(m.id))
+      .slice(0, GOON_LIMIT);
+    if (!members.length) return say(message, 'Nobody to do that to.');
+
+    await message.delete().catch(() => {});
+    for (const member of members) {
+      await speakAs(message.channel, member, content).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return null;
+  }
+
+  const target = await resolveMember(message.guild, args[0]);
+  if (!target) return say(message, `Usage: \`-${command} @user\` or \`-${command} @everyone\``);
+
+  const problem = targetProblem(message, target, command) ??
+    (isImmune(target.id, message.guildId, 'say') ? `${target} is whitelisted from \`-say\`.` : null);
+  if (problem) return say(message, problem);
+
+  await message.delete().catch(() => {});
+  const sent = await speakAs(message.channel, target, content);
+  if (!sent) return say(message, 'I need Manage Webhooks in this channel.');
+  return null;
 }
 
 // ---------- snipes ----------
@@ -669,35 +706,53 @@ const HANDLERS = {
 
   puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
   catify: (message, args) => setPet(message, args, 'meow', 'catify'),
-  async goon(message, args) {
-    const token = args[0]?.toLowerCase();
-    const all = message.mentions.everyone || token === '@everyone' || token === 'everyone';
+  goon: (message, args) => speakOnce(message, args, '💦', 'goon'),
 
-    if (all) {
-      const members = [...message.guild.members.cache.values()]
-        .filter((m) => !m.user.bot && !isSuper(m.id) &&
-          !isImmune(m.id, message.guildId, 'goon'))
-        .slice(0, GOON_LIMIT);
-      if (!members.length) return say(message, 'Nobody to goon.');
+  async say(message, args) {
+    const text = args.slice(1).join(' ').trim();
+    if (!text) return say(message, 'Usage: `-say @user <message>`');
+    return speakOnce(message, args, text, 'say');
+  },
 
-      await message.delete().catch(() => {});
-      for (const member of members) {
-        await speakAs(message.channel, member, '💦').catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-      return null;
+  async phrase(message, args) {
+    const gs = guildState(message.guildId);
+    const sub = args[0]?.toLowerCase();
+
+    if (!sub || sub === 'list') {
+      const lines = Object.entries(gs.phrases)
+        .map(([name, text]) => `\`-${name}\` → ${text}`);
+      return info(message, lines.join('\n') || 'No phrase commands yet.');
     }
 
-    const target = await resolveMember(message.guild, args[0]);
-    if (!target) return say(message, 'Usage: `-goon @user` or `-goon @everyone`');
+    if (sub === 'add') {
+      const name = args[1]?.toLowerCase().replace(/^-+/, '');
+      const text = args.slice(2).join(' ').trim();
+      if (!name || !text) {
+        return say(message, 'Usage: `-phrase add <name> <message>`, e.g. `-phrase add ft i am a failtrader 💔`');
+      }
+      if (!/^[a-z0-9_]{1,20}$/.test(name)) {
+        return say(message, 'Names are letters, numbers and _ only.');
+      }
+      if (COMMANDS.includes(name) || INDEX_COMMANDS.includes(name) ||
+        own(BUILTIN_ALIASES, name) || own(gs.aliases, name)) {
+        return say(message, `\`-${name}\` is already a command.`);
+      }
+      if (text.length > 500) return say(message, 'Keep it under 500 characters.');
 
-    const problem = targetProblem(message, target, 'goon');
-    if (problem) return say(message, problem);
+      gs.phrases[name] = text;
+      save();
+      return ok(message, `\`-${name} @user\` will now post: ${text}`);
+    }
 
-    await message.delete().catch(() => {});
-    const sent = await speakAs(message.channel, target, '💦');
-    if (!sent) return say(message, 'I need Manage Webhooks in this channel.');
-    return null;
+    if (sub === 'remove' || sub === 'delete') {
+      const name = args[1]?.toLowerCase().replace(/^-+/, '');
+      if (!name || !own(gs.phrases, name)) return say(message, "That phrase command doesn't exist.");
+      delete gs.phrases[name];
+      save();
+      return ok(message, `Removed \`-${name}\`.`);
+    }
+
+    return say(message, 'Usage: `-phrase add <name> <message>`, `-phrase remove <name>`, `-phrase list`');
   },
 
   snipe: (message, args) => showSnipe(message, args, 'delete'),
@@ -837,6 +892,9 @@ const HANDLERS = {
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
             '`-puppify @user` / `-catify @user` every word becomes bark / meow (again to undo)',
             '`-goon @user` or `-goon @everyone` posts 💦 as them once',
+            '`-say @user <message>` posts anything as them once',
+            '`-phrase add ft i am a failtrader 💔` makes `-ft @user` do the same',
+            '`-phrase remove <name>`, `-phrase list`',
             '`-purge 20`, `-purge @user 20`, `-purge bot 20`, `-purge image|video|gif 20` (`-c`, `-bc`)',
             '`-fn @user <nickname>` lock their nickname, `-unfn @user` release it',
             '`-lock` / `-unlock` this channel, admins can still talk (`-l` / `-ul`)',
@@ -1332,6 +1390,21 @@ export async function handleMessage(message) {
   if (!message.content.startsWith(PREFIX)) return false;
   const [head, ...args] = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const name = resolveCommand(message.guildId, head);
+  const phrase = name
+    ? null
+    : own(guildState(message.guildId).phrases, head.toLowerCase());
+  if (phrase) {
+    if (!canUse(message.author.id, message.guildId, 'say')) {
+      await say(message, 'Not for you.');
+      return true;
+    }
+    try {
+      await speakOnce(message, args, phrase, head.toLowerCase());
+    } catch (error) {
+      await say(message, `That failed: ${error.message}`);
+    }
+    return true;
+  }
   if (!name || !COMMANDS.includes(name)) return false;
 
   const allowed = canUse(message.author.id, message.guildId, name) ||
