@@ -13,6 +13,7 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.26.5",
-    "libsodium-wrappers": "^0.8.4"
+    "libsodium-wrappers": "^0.8.4",
+    "sharp": "^0.35.3"
   }
 }
