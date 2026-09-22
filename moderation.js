@@ -92,11 +92,34 @@ function resolveCommand(guildId, name, { includeIndex = false } = {}) {
 }
 
 // ---------- helpers ----------
-const say = (message, content) =>
-  message.reply({
-    content: String(content).slice(0, 2000),
-    allowedMentions: { parse: [] },
-  }).catch(() => null);
+// Replies are embeds: green check, red cross, or plain for lists.
+// The check and cross emojis come from this server.
+const EMOJI_GUILD = '1411069905478095020';
+const COLORS = { ok: 0x57f287, fail: 0xed4245, info: 0x2b2d31 };
+const FALLBACK = { check: '✅', cross: '❌' };
+const emojiCache = new Map();
+
+function icon(client, name) {
+  if (emojiCache.has(name)) return emojiCache.get(name);
+  const found = client.guilds.cache.get(EMOJI_GUILD)?.emojis.cache
+    .find((e) => e.name === name)?.toString();
+  if (found) emojiCache.set(name, found);
+  return found ?? FALLBACK[name];
+}
+
+function reply(message, kind, content) {
+  const prefix = kind === 'info' ? ''
+    : `${icon(message.client, kind === 'ok' ? 'check' : 'cross')} `;
+  const embed = new EmbedBuilder()
+    .setColor(COLORS[kind])
+    .setDescription(`${prefix}${content}`.slice(0, 4096));
+  return message.reply({ embeds: [embed], allowedMentions: { parse: [] } })
+    .catch(() => null);
+}
+
+const say = (message, content) => reply(message, 'fail', content);
+const ok = (message, content) => reply(message, 'ok', content);
+const info = (message, content) => reply(message, 'info', content);
 
 const by = (message) =>
   `by ${message.author.username} (${message.author.id})`;
@@ -244,12 +267,12 @@ async function setPet(message, args, sound, command) {
   if (gs.pets[target.id] === sound) {
     delete gs.pets[target.id];
     save();
-    return say(message, `${target} can talk normally again.`);
+    return ok(message, `${target} can talk normally again.`);
   }
 
   gs.pets[target.id] = sound;
   save();
-  return say(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
+  return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
 }
 
 // ---------- commands ----------
@@ -334,7 +357,7 @@ const HANDLERS = {
 
     await target.roles.remove(removable, `strip ${by(message)}`);
     const kept = all.size - removable.size;
-    return say(
+    return ok(
       message,
       `Stripped ${removable.size} roles from ${target}.` +
       (kept ? ` Kept ${kept} that are above me or managed.` : ''),
@@ -354,7 +377,7 @@ const HANDLERS = {
       const role = await message.guild.roles.create({
         name, color, reason: `role create ${by(message)}`,
       });
-      return say(message, `Created ${role}.`);
+      return ok(message, `Created ${role}.`);
     }
 
     if (sub !== 'add' && sub !== 'remove') {
@@ -376,12 +399,12 @@ const HANDLERS = {
       }
       if (target.roles.cache.has(role.id)) return say(message, `${target} already has ${role}.`);
       await target.roles.add(role, `role add ${by(message)}`);
-      return say(message, `Gave ${role} to ${target}.`);
+      return ok(message, `Gave ${role} to ${target}.`);
     }
 
     if (!target.roles.cache.has(role.id)) return say(message, `${target} doesn't have ${role}.`);
     await target.roles.remove(role, `role remove ${by(message)}`);
-    return say(message, `Removed ${role} from ${target}.`);
+    return ok(message, `Removed ${role} from ${target}.`);
   },
 
   async roleban(message, args) {
@@ -400,7 +423,7 @@ const HANDLERS = {
     if (target.roles.cache.has(role.id)) {
       await target.roles.remove(role, `role ban ${by(message)}`);
     }
-    return say(message, `${target} can no longer have ${role}.`);
+    return ok(message, `${target} can no longer have ${role}.`);
   },
 
   async roleunban(message, args) {
@@ -415,15 +438,15 @@ const HANDLERS = {
     gs.roleBans[target.id] = list.filter((id) => id !== role.id);
     if (!gs.roleBans[target.id].length) delete gs.roleBans[target.id];
     save();
-    return say(message, `${target} can have ${role} again.`);
+    return ok(message, `${target} can have ${role} again.`);
   },
 
   async rolebans(message, args) {
     const id = idFrom(args[0]);
     if (!id) return say(message, 'Usage: `-rolebans @user`');
     const list = guildState(message.guildId).roleBans[id] ?? [];
-    if (!list.length) return say(message, `<@${id}> has no role bans.`);
-    return say(message, `<@${id}> is banned from: ${list.map((r) => `<@&${r}>`).join(', ')}`);
+    if (!list.length) return info(message, `<@${id}> has no role bans.`);
+    return info(message, `<@${id}> is banned from: ${list.map((r) => `<@&${r}>`).join(', ')}`);
   },
 
   async timeout(message, args) {
@@ -443,7 +466,7 @@ const HANDLERS = {
     }
 
     await target.timeout(ms, reason ? `${reason} (${by(message)})` : by(message));
-    return say(message, `Timed out ${target} for ${label}.`);
+    return ok(message, `Timed out ${target} for ${label}.`);
   },
 
   async untimeout(message, args) {
@@ -451,7 +474,7 @@ const HANDLERS = {
     if (!target) return say(message, 'Usage: `-untimeout @user`');
     if (!target.isCommunicationDisabled()) return say(message, `${target} isn't timed out.`);
     await target.timeout(null, by(message));
-    return say(message, `Removed ${target}'s timeout.`);
+    return ok(message, `Removed ${target}'s timeout.`);
   },
 
   async ban(message, args) {
@@ -474,14 +497,14 @@ const HANDLERS = {
     await message.guild.members.ban(id, {
       reason: reason ? `${reason} (${by(message)})` : by(message),
     });
-    return say(message, `Banned <@${id}>.`);
+    return ok(message, `Banned <@${id}>.`);
   },
 
   async unban(message, args) {
     const id = idFrom(args[0]);
     if (!id) return say(message, 'Usage: `-unban <id>`');
     await message.guild.members.unban(id, by(message));
-    return say(message, `Unbanned <@${id}>.`);
+    return ok(message, `Unbanned <@${id}>.`);
   },
 
   async rt(message, args) {
@@ -490,8 +513,8 @@ const HANDLERS = {
     const describe = (t) => (t.type === 'mention' ? `pings of <@${t.value}>` : `"${t.value}"`);
 
     if (sub === 'list') {
-      if (!gs.reactions.length) return say(message, 'No auto reactions set.');
-      return say(message, gs.reactions
+      if (!gs.reactions.length) return info(message, 'No auto reactions set.');
+      return info(message, gs.reactions
         .map((t, i) => `${i + 1}. ${describe(t)} → ${t.emoji}`)
         .join('\n'));
     }
@@ -503,13 +526,13 @@ const HANDLERS = {
       }
       const [removed] = gs.reactions.splice(n - 1, 1);
       save();
-      return say(message, `Removed ${describe(removed)} → ${removed.emoji}.`);
+      return ok(message, `Removed ${describe(removed)} → ${removed.emoji}.`);
     }
 
     if (sub === 'clear') {
       gs.reactions = [];
       save();
-      return say(message, 'Cleared all auto reactions.');
+      return ok(message, 'Cleared all auto reactions.');
     }
 
     const rest = sub === 'add' ? args.slice(1) : args;
@@ -536,7 +559,7 @@ const HANDLERS = {
 
     gs.reactions.push(trigger);
     save();
-    return say(message, `Added: ${describe(trigger)} → ${emoji}`);
+    return ok(message, `Added: ${describe(trigger)} → ${emoji}`);
   },
 
   async alias(message, args) {
@@ -546,7 +569,7 @@ const HANDLERS = {
     if (!sub || sub === 'list') {
       const lines = Object.entries({ ...BUILTIN_ALIASES, ...gs.aliases })
         .map(([a, c]) => `\`-${a}\` → \`-${c}\`${own(gs.aliases, a) ? '' : ' (built in)'}`);
-      return say(message, lines.join('\n') || 'No aliases.');
+      return info(message, lines.join('\n') || 'No aliases.');
     }
 
     if (sub === 'add') {
@@ -559,7 +582,7 @@ const HANDLERS = {
       }
       gs.aliases[name] = target;
       save();
-      return say(message, `\`-${name}\` now runs \`-${target}\`.`);
+      return ok(message, `\`-${name}\` now runs \`-${target}\`.`);
     }
 
     if (sub === 'remove' || sub === 'delete') {
@@ -567,7 +590,7 @@ const HANDLERS = {
       if (!name || !own(gs.aliases, name)) return say(message, "That alias doesn't exist (built in ones can't be removed).");
       delete gs.aliases[name];
       save();
-      return say(message, `Removed \`-${name}\`.`);
+      return ok(message, `Removed \`-${name}\`.`);
     }
 
     return say(message, 'Usage: `-alias add <name> <command>`, `-alias remove <name>`, `-alias list`');
@@ -580,8 +603,8 @@ const HANDLERS = {
 
     if (!userId) {
       const entries = Object.entries(gs.perms);
-      if (!entries.length) return say(message, 'Nobody has bot access in this server yet.');
-      return say(message, entries.map(([id, e]) => {
+      if (!entries.length) return info(message, 'Nobody has bot access in this server yet.');
+      return info(message, entries.map(([id, e]) => {
         const denied = e.denied?.length
           ? ` (blocked: ${e.denied.map((c) => `-${c}`).join(', ')})`
           : '';
@@ -598,12 +621,12 @@ const HANDLERS = {
       if (!entry) return say(message, `<@${userId}> has no bot access here. Run \`-perms @user\` first.`);
       entry.denied = (entry.denied ?? []).filter((c) => c !== cmd);
       save();
-      return say(message, `<@${userId}> can use \`-${cmd}\` again.`);
+      return ok(message, `<@${userId}> can use \`-${cmd}\` again.`);
     }
 
     gs.perms[userId] = { denied: [] };
     save();
-    return say(message, `<@${userId}> now has full bot access in this server.`);
+    return ok(message, `<@${userId}> now has full bot access in this server.`);
   },
 
   async removeperm(message, args) {
@@ -621,12 +644,12 @@ const HANDLERS = {
       if (!cmd) return say(message, `\`${flag}\` isn't a command.`);
       entry.denied = [...new Set([...(entry.denied ?? []), cmd])];
       save();
-      return say(message, `<@${userId}> can no longer use \`-${cmd}\`.`);
+      return ok(message, `<@${userId}> can no longer use \`-${cmd}\`.`);
     }
 
     delete gs.perms[userId];
     save();
-    return say(message, `<@${userId}> no longer has bot access here.`);
+    return ok(message, `<@${userId}> no longer has bot access here.`);
   },
 };
 
