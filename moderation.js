@@ -655,6 +655,15 @@ const HANDLERS = {
 };
 
 // ---------- auto reactions ----------
+// Anyone saying w/l in this channel gets a thumbs up and thumbs down.
+const WL_CHANNEL = '1551973120854855700';
+
+async function runWl(message) {
+  if (message.channelId !== WL_CHANNEL || !/w\/l/i.test(message.content)) return;
+  await message.react('👍').catch(() => {});
+  await message.react('👎').catch(() => {});
+}
+
 function runReactions(message) {
   const list = own(state.guilds, message.guildId)?.reactions;
   if (!list?.length) return;
@@ -681,6 +690,7 @@ export async function handleMessage(message) {
     }
   }
 
+  runWl(message);
   runReactions(message);
 
   if (!message.content.startsWith(PREFIX)) return false;
