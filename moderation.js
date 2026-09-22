@@ -118,7 +118,8 @@ function reply(message, kind, content) {
 }
 
 const say = (message, content) => reply(message, 'fail', content);
-const ok = (message, content) => reply(message, 'ok', content);
+export const fail = say;
+export const ok = (message, content) => reply(message, 'ok', content);
 const info = (message, content) => reply(message, 'info', content);
 
 const by = (message) =>

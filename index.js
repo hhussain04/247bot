@@ -763,7 +763,6 @@ client.on('messageCreate', async (message) => {
     try {
       await message.delete();
       log(`deleted message from muzzled user ${message.author.id}`);
-      await sendMuzzleNotice(message);
     } catch (error) {
       log(
         `failed to delete muzzled message from ` +
@@ -803,9 +802,7 @@ client.on('messageCreate', async (message) => {
   }
 
   if (isMuzzleCommand && !isOwner) {
-    await message.reply(
-      'Only the bot owner can manage muzzles.',
-    ).catch(() => {});
+    await mod.fail(message, 'Only the bot owner can manage muzzles.');
 
     return;
   }
@@ -817,25 +814,19 @@ client.on('messageCreate', async (message) => {
     const target = await resolveMuzzleTarget(message);
 
     if (!target) {
-      await message.reply(
-        'Usage: `-muzzle @user`',
-      ).catch(() => {});
+      await mod.fail(message, 'Usage: `-muzzle @user`');
 
       return;
     }
 
     if (target.id === OWNER_ID) {
-      await message.reply(
-        'The bot owner cannot be muzzled.',
-      ).catch(() => {});
+      await mod.fail(message, 'The bot owner cannot be muzzled.');
 
       return;
     }
 
     if (target.bot) {
-      await message.reply(
-        'Bots cannot be muzzled.',
-      ).catch(() => {});
+      await mod.fail(message, 'Bots cannot be muzzled.');
 
       return;
     }
@@ -845,15 +836,9 @@ client.on('messageCreate', async (message) => {
     muzzledUserIds.add(target.id);
     saveState();
 
-    await message.reply({
-      content: alreadyMuzzled
-        ? `${target} was already muzzled.`
-        : `${target} is now muzzled.`,
-      embeds: [buildMuzzleEmbed(target, message.guild)],
-      allowedMentions: { parse: [] },
-    }).catch((error) => {
-      log(`failed to confirm muzzle: ${error.message}`);
-    });
+    await (alreadyMuzzled
+      ? mod.fail(message, `${target} is already muzzled.`)
+      : mod.ok(message, `${target} has been muzzled. shut up retard`));
 
     return;
   }
@@ -865,9 +850,7 @@ client.on('messageCreate', async (message) => {
     const target = await resolveMuzzleTarget(message);
 
     if (!target) {
-      await message.reply(
-        'Usage: `-unmuzzle @user`',
-      ).catch(() => {});
+      await mod.fail(message, 'Usage: `-unmuzzle @user`');
 
       return;
     }
@@ -875,12 +858,9 @@ client.on('messageCreate', async (message) => {
     const wasMuzzled = muzzledUserIds.delete(target.id);
     saveState();
 
-    await message.reply({
-      content: wasMuzzled
-        ? `${target} is no longer muzzled.`
-        : `${target} was not muzzled.`,
-      allowedMentions: { parse: [] },
-    }).catch(() => {});
+    await (wasMuzzled
+      ? mod.ok(message, `${target} has been unmuzzled. wlc back`)
+      : mod.fail(message, `${target} is not muzzled, are u stupid?`));
 
     return;
   }
