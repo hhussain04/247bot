@@ -23,8 +23,8 @@ export const isSuper = (userId) => SUPER_IDS.has(userId);
 const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
-  'puppify', 'catify', 'forcenick', 'lock', 'unlock', 'invitedby',
-  'copychannelperms',
+  'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
+  'copychannelperms', 'purge', 'bc',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
   'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
@@ -47,6 +47,7 @@ const BUILTIN_ALIASES = {
   l: 'lock',
   ul: 'unlock',
   ccp: 'copychannelperms',
+  c: 'purge',
   commands: 'help',
 };
 
@@ -119,14 +120,19 @@ function icon(client, name) {
   return found ?? FALLBACK[name];
 }
 
-function reply(message, kind, content) {
+function buildEmbed(client, kind, content) {
   const prefix = kind === 'info' ? ''
-    : `${icon(message.client, kind === 'ok' ? 'check' : 'cross')} `;
-  const embed = new EmbedBuilder()
+    : `${icon(client, kind === 'ok' ? 'check' : 'cross')} `;
+  return new EmbedBuilder()
     .setColor(COLORS[kind])
     .setDescription(`${prefix}${content}`.slice(0, 4096));
-  return message.reply({ embeds: [embed], allowedMentions: { parse: [] } })
-    .catch(() => null);
+}
+
+function reply(message, kind, content) {
+  return message.reply({
+    embeds: [buildEmbed(message.client, kind, content)],
+    allowedMentions: { parse: [] },
+  }).catch(() => null);
 }
 
 const say = (message, content) => reply(message, 'fail', content);
@@ -247,32 +253,36 @@ async function getWebhook(channel) {
   return hook;
 }
 
-// Deletes the message and reposts it as the same name and avatar,
-// with one sound per word.
-async function petify(message, sound) {
-  const words = message.content.split(/\s+/).filter(Boolean).length || 1;
-  const content = Array(Math.min(words, 300)).fill(sound).join(' ');
-  const hook = await getWebhook(message.channel);
+// Posts as someone else, using their name and avatar.
+async function speakAs(channel, member, content) {
+  const hook = await getWebhook(channel);
   if (!hook) return false;
 
   // Webhook names can't contain "discord" or "clyde".
-  const name = (message.member?.displayName ?? message.author.username)
-    .replace(/discord|clyde/gi, '').trim() || 'someone';
+  const name = member.displayName.replace(/discord|clyde/gi, '').trim() || 'someone';
 
-  await message.delete();
   try {
     await hook.send({
       content,
       username: name.slice(0, 80),
-      avatarURL: (message.member ?? message.author).displayAvatarURL(),
-      threadId: message.channel.isThread() ? message.channel.id : undefined,
+      avatarURL: member.displayAvatarURL(),
+      threadId: channel.isThread() ? channel.id : undefined,
       allowedMentions: { parse: [] },
     });
   } catch (error) {
-    webhookCache.delete(message.channel.isThread() ? message.channel.parentId : message.channel.id);
+    webhookCache.delete(channel.isThread() ? channel.parentId : channel.id);
     throw error;
   }
   return true;
+}
+
+// Deletes the message and reposts it with one sound per word.
+async function petify(message, sound) {
+  if (!message.member) return false;
+  const words = message.content.split(/\s+/).filter(Boolean).length || 1;
+  const content = Array(Math.min(words, 300)).fill(sound).join(' ');
+  await message.delete();
+  return speakAs(message.channel, message.member, content);
 }
 
 async function setPet(message, args, sound, command) {
@@ -292,6 +302,80 @@ async function setPet(message, args, sound, command) {
   gs.pets[target.id] = sound;
   save();
   return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
+}
+
+// ---------- purge ----------
+const GOON_LIMIT = 30;
+
+const MEDIA = {
+  image: (m) =>
+    m.attachments.some((a) => a.contentType?.startsWith('image/')) ||
+    m.embeds.some((e) => e.image || e.thumbnail),
+  video: (m) =>
+    m.attachments.some((a) => a.contentType?.startsWith('video/')) ||
+    m.embeds.some((e) => e.video),
+  gif: (m) =>
+    m.attachments.some((a) => /\.gif$/i.test(a.name ?? '')) ||
+    m.embeds.some((e) => e.data?.type === 'gifv' || /\.gif/i.test(e.thumbnail?.url ?? '')),
+};
+
+async function purge(message, args, forced) {
+  const { channel, guild } = message;
+  if (!channel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageMessages)) {
+    return say(message, 'I need Manage Messages in this channel.');
+  }
+
+  let filter = forced;
+  let rest = args;
+
+  if (!filter) {
+    const token = args[0]?.toLowerCase();
+    const userId = idFrom(args[0]);
+    if (userId) {
+      filter = { type: 'user', id: userId };
+      rest = args.slice(1);
+    } else if (token === 'bot' || token === 'bots') {
+      filter = { type: 'bot' };
+      rest = args.slice(1);
+    } else if (token && Object.hasOwn(MEDIA, token.replace(/s$/, ''))) {
+      filter = { type: 'media', kind: token.replace(/s$/, '') };
+      rest = args.slice(1);
+    }
+  }
+
+  const amount = rest[0] === undefined && filter ? 20 : Number(rest[0]);
+  if (!Number.isInteger(amount) || amount < 1 || amount > 100) {
+    return say(message, 'Usage: `-purge 20`, `-purge @user 20`, `-purge bot 20`, `-purge image|video|gif 20`');
+  }
+
+  const matches = (m) => {
+    if (!filter) return true;
+    if (filter.type === 'user') return m.author.id === filter.id;
+    if (filter.type === 'bot') return m.author.bot;
+    return MEDIA[filter.kind](m);
+  };
+
+  const fetched = await channel.messages.fetch({ limit: 100 });
+  const picked = [...fetched.values()]
+    .filter((m) => m.id !== message.id && matches(m))
+    .slice(0, amount);
+
+  await message.delete().catch(() => {});
+  if (!picked.length) {
+    const none = await channel.send({ embeds: [buildEmbed(message.client, 'fail', 'Nothing to delete.')] });
+    setTimeout(() => none.delete().catch(() => {}), 5_000);
+    return null;
+  }
+
+  const deleted = await channel.bulkDelete(picked, true);
+  const skipped = picked.length - deleted.size;
+  const notice = await channel.send({
+    embeds: [buildEmbed(message.client, 'ok',
+      `Deleted ${deleted.size} messages.` +
+      (skipped ? ` ${skipped} were over 14 days old and left alone.` : ''))],
+  });
+  setTimeout(() => notice.delete().catch(() => {}), 5_000);
+  return null;
 }
 
 // ---------- channel lock ----------
@@ -496,6 +580,38 @@ const HANDLERS = {
 
   puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
   catify: (message, args) => setPet(message, args, 'meow', 'catify'),
+  async goon(message, args) {
+    const token = args[0]?.toLowerCase();
+    const all = message.mentions.everyone || token === '@everyone' || token === 'everyone';
+
+    if (all) {
+      const members = [...message.guild.members.cache.values()]
+        .filter((m) => !m.user.bot && !isSuper(m.id))
+        .slice(0, GOON_LIMIT);
+      if (!members.length) return say(message, 'Nobody to goon.');
+
+      await message.delete().catch(() => {});
+      for (const member of members) {
+        await speakAs(message.channel, member, '💦').catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return null;
+    }
+
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return say(message, 'Usage: `-goon @user` or `-goon @everyone`');
+
+    const problem = targetProblem(message, target);
+    if (problem) return say(message, problem);
+
+    await message.delete().catch(() => {});
+    const sent = await speakAs(message.channel, target, '💦');
+    if (!sent) return say(message, 'I need Manage Webhooks in this channel.');
+    return null;
+  },
+
+  purge: (message, args) => purge(message, args, null),
+  bc: (message, args) => purge(message, args, { type: 'bot' }),
 
   async invitedby(message, args) {
     const id = idFrom(args[0]);
@@ -617,6 +733,8 @@ const HANDLERS = {
             '`-unban <id>`',
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
             '`-puppify @user` / `-catify @user` every word becomes bark / meow (again to undo)',
+            '`-goon @user` or `-goon @everyone` posts 💦 as them once',
+            '`-purge 20`, `-purge @user 20`, `-purge bot 20`, `-purge image|video|gif 20` (`-c`, `-bc`)',
             '`-fn @user <nickname>` lock their nickname, `-unfn @user` release it',
             '`-lock` / `-unlock` this channel, admins can still talk (`-l` / `-ul`)',
             '`-copychannelperms @from @to` copy one role\'s channel permissions onto another (`-ccp`)',
