@@ -25,11 +25,23 @@ const COMMANDS = [
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
   'copychannelperms', 'purge', 'bc', 'whitelist', 'unwhitelist',
+  'snipe', 'editsnipe', 'reactionsnipe', 'clearsnipe', 'snipeperms',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
   'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
 ];
-const SUPER_ONLY = new Set(['perms', 'removeperm', 'whitelist', 'unwhitelist']);
+const SUPER_ONLY = new Set([
+  'perms', 'removeperm', 'whitelist', 'unwhitelist', 'snipeperms',
+]);
+// Granted separately with -snipeperms.
+const SNIPE_CMDS = new Set(['snipe', 'editsnipe', 'reactionsnipe']);
+
+// These three still trigger an @ auto reaction when they reply to someone.
+const RT_REPLY_BYPASS = new Set([
+  '379943872278822922',
+  '710963509910962258',
+  '1535620349209874502',
+]);
 
 // Commands handled in index.js. Listed so -removeperm can target them
 // and so aliases can't shadow them.
@@ -48,6 +60,11 @@ const BUILTIN_ALIASES = {
   ul: 'unlock',
   ccp: 'copychannelperms',
   c: 'purge',
+  s: 'snipe',
+  es: 'editsnipe',
+  rs: 'reactionsnipe',
+  cs: 'clearsnipe',
+  sp: 'snipeperms',
   wl: 'whitelist',
   unwl: 'unwhitelist',
   commands: 'help',
@@ -84,6 +101,7 @@ function guildState(guildId) {
   gs.locks ??= {};
   gs.invitedBy ??= {};
   gs.immune ??= {};
+  gs.snipers ??= {};
   return gs;
 }
 
@@ -103,6 +121,9 @@ export function isImmune(userId, guildId, command) {
   if (!list?.length) return false;
   return list.includes('all') || list.includes(command);
 }
+
+const canSnipe = (userId, guildId) =>
+  Boolean(own(own(state.guilds, guildId)?.snipers, userId));
 
 function resolveCommand(guildId, name, { includeIndex = false } = {}) {
   const key = name?.toLowerCase().replace(/^-+/, '');
@@ -315,6 +336,58 @@ async function setPet(message, args, sound, command) {
   gs.pets[target.id] = sound;
   save();
   return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
+}
+
+// ---------- snipes ----------
+// Kept in memory only, newest first, ten per channel.
+const SNIPE_LIMIT = 10;
+const snipes = { delete: new Map(), edit: new Map(), reaction: new Map() };
+
+function pushSnipe(kind, channelId, entry) {
+  const list = snipes[kind].get(channelId) ?? [];
+  list.unshift(entry);
+  snipes[kind].set(channelId, list.slice(0, SNIPE_LIMIT));
+}
+
+const SNIPE_LABEL = {
+  delete: 'deleted messages',
+  edit: 'edited messages',
+  reaction: 'removed reactions',
+};
+
+async function showSnipe(message, args, kind) {
+  const named = channelFrom(message.guild, args[0]);
+  const channel = named ?? message.channel;
+  const rest = named ? args.slice(1) : args;
+  const index = Number(rest[0] ?? 1);
+
+  const list = snipes[kind].get(channel.id) ?? [];
+  if (!list.length) return say(message, `No ${SNIPE_LABEL[kind]} to snipe in ${channel}.`);
+  if (!Number.isInteger(index) || index < 1 || index > list.length) {
+    return say(message, `Pick 1 to ${list.length}.`);
+  }
+
+  const entry = list[index - 1];
+  const user = await message.client.users.fetch(entry.userId).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setAuthor({
+      name: user?.username ?? 'unknown user',
+      iconURL: user?.displayAvatarURL(),
+    })
+    .setTimestamp(entry.at)
+    .setFooter({ text: `${index}/${list.length}` });
+
+  if (kind === 'reaction') {
+    embed.setDescription(`removed ${entry.emoji} from [this message](${entry.url})`);
+  } else {
+    embed.setDescription(entry.content || '(no text)');
+    if (kind === 'edit') embed.addFields({ name: 'Edited', value: `[jump](${entry.url})` });
+    if (entry.image) embed.setImage(entry.image);
+  }
+
+  return message.reply({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => null);
 }
 
 // ---------- purge ----------
@@ -627,6 +700,19 @@ const HANDLERS = {
     return null;
   },
 
+  snipe: (message, args) => showSnipe(message, args, 'delete'),
+  editsnipe: (message, args) => showSnipe(message, args, 'edit'),
+  reactionsnipe: (message, args) => showSnipe(message, args, 'reaction'),
+
+  async clearsnipe(message) {
+    if (!message.channel.permissionsFor(message.guild.members.me)
+      ?.has(PermissionFlagsBits.ManageMessages)) {
+      return say(message, 'I need Manage Messages in this channel.');
+    }
+    for (const store of Object.values(snipes)) store.delete(message.channel.id);
+    return ok(message, 'Cleared the snipes for this channel.');
+  },
+
   purge: (message, args) => purge(message, args, null),
   bc: (message, args) => purge(message, args, { type: 'bot' }),
 
@@ -771,6 +857,16 @@ const HANDLERS = {
             '`-setwelcomechannel #channel`, `-changewelcomechannel #channel`, `-removewelcomebinding`',
             '`-setgoodbyechannel #channel`, `-changegoodbyechannel #channel`, `-removegoodbyebinding`',
             '`-invitedby @user` which invite they joined with',
+          ].join('\n'),
+        },
+        {
+          name: 'Snipes',
+          value: [
+            '`-s [channel] [number]` last deleted message',
+            '`-es [channel] [number]` last edited message',
+            '`-rs [channel] [number]` last removed reaction',
+            '`-cs` clear this channel\'s snipes',
+            '`-snipeperms @user` give or take snipe access, bot admins only (`-sp`)',
           ].join('\n'),
         },
         {
@@ -1053,6 +1149,28 @@ const HANDLERS = {
     return say(message, 'Usage: `-alias add <name> <command>`, `-alias remove <name>`, `-alias list`');
   },
 
+  async snipeperms(message, args) {
+    const gs = guildState(message.guildId);
+    const userId = idFrom(args[0]);
+
+    if (!userId) {
+      const list = Object.keys(gs.snipers);
+      return list.length
+        ? info(message, `Snipe access: ${list.map((id) => `<@${id}>`).join(', ')}`)
+        : info(message, 'Nobody has snipe access in this server.');
+    }
+
+    if (gs.snipers[userId]) {
+      delete gs.snipers[userId];
+      save();
+      return ok(message, `<@${userId}> can no longer use the snipe commands.`);
+    }
+
+    gs.snipers[userId] = true;
+    save();
+    return ok(message, `<@${userId}> can now use \`-s\`, \`-es\` and \`-rs\`.`);
+  },
+
   async whitelist(message, args) {
     const gs = guildState(message.guildId);
     const userId = idFrom(args.find((a) => idFrom(a)));
@@ -1180,9 +1298,15 @@ function runReactions(message) {
   const list = own(state.guilds, message.guildId)?.reactions;
   if (!list?.length) return;
   for (const trigger of list) {
-    const hit = trigger.type === 'mention'
-      ? message.mentions.users.has(trigger.value)
-      : phraseRegex(trigger.value).test(message.content);
+    let hit;
+    if (trigger.type === 'mention') {
+      // A reply ping doesn't count unless one of the three sent it.
+      hit = message.mentions.users.has(trigger.value) && (
+        new RegExp(`<@!?${trigger.value}>`).test(message.content) ||
+        RT_REPLY_BYPASS.has(message.author.id));
+    } else {
+      hit = phraseRegex(trigger.value).test(message.content);
+    }
     if (hit) message.react(trigger.emoji).catch(() => {});
   }
 }
@@ -1210,7 +1334,10 @@ export async function handleMessage(message) {
   const name = resolveCommand(message.guildId, head);
   if (!name || !COMMANDS.includes(name)) return false;
 
-  if (!canUse(message.author.id, message.guildId, name)) {
+  const allowed = canUse(message.author.id, message.guildId, name) ||
+    (SNIPE_CMDS.has(name) && canSnipe(message.author.id, message.guildId));
+
+  if (!allowed) {
     await say(message, SUPER_ONLY.has(name) ? 'Only bot admins can do that.' : 'Not for you.');
     return true;
   }
@@ -1252,6 +1379,38 @@ export function attach(client) {
     sendGreeting(member, 'welcome', invite);
     setTimeout(() => enforce(member), 3_000);
     setTimeout(() => enforceNick(member), 3_000);
+  });
+
+  client.on('messageDelete', (message) => {
+    if (!message.guild || message.author?.bot) return;
+    if (!message.content && !message.attachments?.size) return;
+    pushSnipe('delete', message.channelId, {
+      userId: message.author.id,
+      content: message.content,
+      image: message.attachments.find((a) => a.contentType?.startsWith('image/'))?.url ?? null,
+      at: Date.now(),
+    });
+  });
+
+  client.on('messageUpdate', (before, after) => {
+    if (!after.guild || after.author?.bot) return;
+    if (!before.content || before.content === after.content) return;
+    pushSnipe('edit', after.channelId, {
+      userId: after.author.id,
+      content: before.content,
+      url: after.url,
+      at: Date.now(),
+    });
+  });
+
+  client.on('messageReactionRemove', (reaction, user) => {
+    if (!reaction.message.guild || user.bot) return;
+    pushSnipe('reaction', reaction.message.channelId, {
+      userId: user.id,
+      emoji: reaction.emoji.toString(),
+      url: reaction.message.url,
+      at: Date.now(),
+    });
   });
 
   client.on('inviteCreate', (invite) => { cacheInvites(invite.guild); });
