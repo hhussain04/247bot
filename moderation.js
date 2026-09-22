@@ -24,6 +24,8 @@ const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'perms', 'removeperm',
+  'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
+  'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
 ];
 const SUPER_ONLY = new Set(['perms', 'removeperm']);
 
@@ -276,8 +278,84 @@ async function setPet(message, args, sound, command) {
   return ok(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
 }
 
+// ---------- welcome / goodbye ----------
+const GREETINGS = {
+  welcome: { color: 0x57f287, text: 'welcome loser', label: 'Joined' },
+  goodbye: { color: 0xed4245, text: 'u wont be missed', label: 'Left' },
+};
+
+function channelFrom(guild, token) {
+  const id = token?.match(/^<#(\d{17,20})>$|^(\d{17,20})$/);
+  const channel = id ? guild.channels.cache.get(id[1] ?? id[2]) : null;
+  return channel?.isTextBased() ? channel : null;
+}
+
+async function bindGreeting(message, args, kind, mode) {
+  const gs = guildState(message.guildId);
+  const current = gs[kind];
+  const cmd = {
+    set: `-set${kind}channel`,
+    change: `-change${kind}channel`,
+    remove: `-remove${kind}binding`,
+  };
+
+  if (mode === 'remove') {
+    if (!current) return say(message, `No ${kind} channel is set.`);
+    if (args[0] && channelFrom(message.guild, args[0])?.id !== current) {
+      return say(message, `The ${kind} channel is <#${current}>, not that one.`);
+    }
+    delete gs[kind];
+    save();
+    return ok(message, `Removed the ${kind} channel (was <#${current}>).`);
+  }
+
+  const channel = channelFrom(message.guild, args[0]);
+  if (!channel) return say(message, `Usage: \`${cmd[mode]} #channel\` or a channel ID`);
+  if (mode === 'set' && current) {
+    return say(message, `The ${kind} channel is already <#${current}>. Use \`${cmd.change}\`.`);
+  }
+  if (mode === 'change' && !current) {
+    return say(message, `No ${kind} channel is set yet. Use \`${cmd.set}\`.`);
+  }
+
+  const perms = channel.permissionsFor(message.guild.members.me);
+  if (!perms?.has(['ViewChannel', 'SendMessages', 'EmbedLinks'])) {
+    return say(message, `I can't send embeds in ${channel}.`);
+  }
+
+  gs[kind] = channel.id;
+  save();
+  return ok(message, `${kind === 'welcome' ? 'Welcome' : 'Goodbye'} messages will go to ${channel}.`);
+}
+
+async function sendGreeting(member, kind) {
+  const channelId = own(state.guilds, member.guild.id)?.[kind];
+  const channel = channelId ? member.guild.channels.cache.get(channelId) : null;
+  if (!channel?.isTextBased()) return;
+
+  const { color, text, label } = GREETINGS[kind];
+  const at = kind === 'welcome' ? (member.joinedTimestamp ?? Date.now()) : Date.now();
+  const unix = Math.floor(at / 1000);
+
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(member.user.username)
+    .setDescription(`${text} ${member.user}`)
+    .setThumbnail(member.displayAvatarURL({ size: 256 }))
+    .addFields({ name: label, value: `<t:${unix}:F> (<t:${unix}:R>)` });
+
+  await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+}
+
 // ---------- commands ----------
 const HANDLERS = {
+  setwelcomechannel: (m, a) => bindGreeting(m, a, 'welcome', 'set'),
+  changewelcomechannel: (m, a) => bindGreeting(m, a, 'welcome', 'change'),
+  removewelcomebinding: (m, a) => bindGreeting(m, a, 'welcome', 'remove'),
+  setgoodbyechannel: (m, a) => bindGreeting(m, a, 'goodbye', 'set'),
+  changegoodbyechannel: (m, a) => bindGreeting(m, a, 'goodbye', 'change'),
+  removegoodbyebinding: (m, a) => bindGreeting(m, a, 'goodbye', 'remove'),
+
   puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
   catify: (message, args) => setPet(message, args, 'meow', 'catify'),
 
@@ -320,6 +398,13 @@ const HANDLERS = {
             '`-rt add @user <emoji>` react when they get pinged',
             '`-rt add <word or phrase> <emoji>` react when it is said',
             '`-rt list`, `-rt remove <number>`, `-rt clear`',
+          ].join('\n'),
+        },
+        {
+          name: 'Welcome / goodbye',
+          value: [
+            '`-setwelcomechannel #channel`, `-changewelcomechannel #channel`, `-removewelcomebinding`',
+            '`-setgoodbyechannel #channel`, `-changegoodbyechannel #channel`, `-removegoodbyebinding`',
           ].join('\n'),
         },
         {
@@ -722,6 +807,15 @@ export function attach(client) {
 
   client.on('guildMemberUpdate', (_old, member) => { enforce(member); });
   client.on('guildMemberAdd', (member) => {
+    sendGreeting(member, 'welcome');
     setTimeout(() => enforce(member), 3_000);
+  });
+  client.on('guildMemberRemove', (member) => { sendGreeting(member, 'goodbye'); });
+
+  // Leave events only fire for cached members, so cache everyone on start.
+  client.once('clientReady', () => {
+    for (const guild of client.guilds.cache.values()) {
+      guild.members.fetch().catch(() => {});
+    }
   });
 }
