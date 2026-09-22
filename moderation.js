@@ -24,12 +24,12 @@ const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
-  'copychannelperms', 'purge', 'bc',
+  'copychannelperms', 'purge', 'bc', 'whitelist', 'unwhitelist',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
   'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
 ];
-const SUPER_ONLY = new Set(['perms', 'removeperm']);
+const SUPER_ONLY = new Set(['perms', 'removeperm', 'whitelist', 'unwhitelist']);
 
 // Commands handled in index.js. Listed so -removeperm can target them
 // and so aliases can't shadow them.
@@ -48,6 +48,8 @@ const BUILTIN_ALIASES = {
   ul: 'unlock',
   ccp: 'copychannelperms',
   c: 'purge',
+  wl: 'whitelist',
+  unwl: 'unwhitelist',
   commands: 'help',
 };
 
@@ -81,6 +83,7 @@ function guildState(guildId) {
   gs.nicks ??= {};
   gs.locks ??= {};
   gs.invitedBy ??= {};
+  gs.immune ??= {};
   return gs;
 }
 
@@ -92,6 +95,13 @@ export function canUse(userId, guildId, command) {
   if (!guildId || SUPER_ONLY.has(command)) return false;
   const entry = own(own(state.guilds, guildId)?.perms, userId);
   return Boolean(entry) && !(entry.denied ?? []).includes(command);
+}
+
+// Whitelisted users are ignored by the commands they're whitelisted from.
+export function isImmune(userId, guildId, command) {
+  const list = own(own(state.guilds, guildId)?.immune, userId);
+  if (!list?.length) return false;
+  return list.includes('all') || list.includes(command);
 }
 
 function resolveCommand(guildId, name, { includeIndex = false } = {}) {
@@ -203,10 +213,13 @@ function phraseRegex(phrase) {
 }
 
 // Returns an error string, or null if the caller may act on the target.
-function targetProblem(message, target) {
+function targetProblem(message, target, command) {
   const callerId = message.author.id;
   const guild = message.guild;
   if (target.id === message.client.user.id) return 'Not on me.';
+  if (command && isImmune(target.id, message.guildId, command)) {
+    return `${target} is whitelisted from \`-${command}\`.`;
+  }
   if (isSuper(target.id) && !isSuper(callerId)) {
     return "You can't use that on a bot admin.";
   }
@@ -289,7 +302,7 @@ async function setPet(message, args, sound, command) {
   const target = await resolveMember(message.guild, args[0]);
   if (!target) return say(message, `Usage: \`-${command} @user\` (run it again to undo)`);
 
-  const problem = targetProblem(message, target);
+  const problem = targetProblem(message, target, command);
   if (problem) return say(message, problem);
 
   const gs = guildState(message.guildId);
@@ -332,6 +345,9 @@ async function purge(message, args, forced) {
     const token = args[0]?.toLowerCase();
     const userId = idFrom(args[0]);
     if (userId) {
+      if (isImmune(userId, message.guildId, 'purge')) {
+        return say(message, `<@${userId}> is whitelisted from \`-purge\`.`);
+      }
       filter = { type: 'user', id: userId };
       rest = args.slice(1);
     } else if (token === 'bot' || token === 'bots') {
@@ -586,7 +602,8 @@ const HANDLERS = {
 
     if (all) {
       const members = [...message.guild.members.cache.values()]
-        .filter((m) => !m.user.bot && !isSuper(m.id))
+        .filter((m) => !m.user.bot && !isSuper(m.id) &&
+          !isImmune(m.id, message.guildId, 'goon'))
         .slice(0, GOON_LIMIT);
       if (!members.length) return say(message, 'Nobody to goon.');
 
@@ -601,7 +618,7 @@ const HANDLERS = {
     const target = await resolveMember(message.guild, args[0]);
     if (!target) return say(message, 'Usage: `-goon @user` or `-goon @everyone`');
 
-    const problem = targetProblem(message, target);
+    const problem = targetProblem(message, target, 'goon');
     if (problem) return say(message, problem);
 
     await message.delete().catch(() => {});
@@ -679,7 +696,7 @@ const HANDLERS = {
       return say(message, 'Usage: `-fn @user nickname`, or `-unfn @user` to release it');
     }
 
-    const problem = targetProblem(message, target);
+    const problem = targetProblem(message, target, 'forcenick');
     if (problem) return say(message, problem);
 
     const gs = guildState(message.guildId);
@@ -771,6 +788,8 @@ const HANDLERS = {
             '`-perms -<command> @user` give back one command',
             '`-removeperm @user` take all access',
             '`-removeperm -<command> @user` take one command',
+            '`-whitelist @user [commands]` make the bot ignore them (`-wl`)',
+            '`-unwhitelist @user [commands]` undo it (`-unwl`)',
           ].join('\n'),
         },
         { name: 'Aliases', value: (aliases || 'none').slice(0, 1024) },
@@ -783,7 +802,7 @@ const HANDLERS = {
     const target = await resolveMember(message.guild, args[0]);
     if (!target) return say(message, 'Usage: `-strip @user`');
 
-    const problem = targetProblem(message, target);
+    const problem = targetProblem(message, target, 'strip');
     if (problem) return say(message, problem);
 
     const all = target.roles.cache.filter((r) => r.id !== message.guild.id);
@@ -825,7 +844,7 @@ const HANDLERS = {
       return say(message, `Usage: \`-role ${sub} @user <role>\`. Role can be a mention, ID or name.`);
     }
 
-    const problem = targetProblem(message, target) ?? roleProblem(message, role);
+    const problem = targetProblem(message, target, 'role') ?? roleProblem(message, role);
     if (problem) return say(message, problem);
 
     if (sub === 'add') {
@@ -847,7 +866,7 @@ const HANDLERS = {
     const role = resolveRole(message.guild, args.slice(1).join(' '));
     if (!target || !role) return say(message, 'Usage: `-roleban @user <role>`');
 
-    const problem = targetProblem(message, target) ?? roleProblem(message, role);
+    const problem = targetProblem(message, target, 'roleban') ?? roleProblem(message, role);
     if (problem) return say(message, problem);
 
     const gs = guildState(message.guildId);
@@ -894,7 +913,7 @@ const HANDLERS = {
     const reason = args.slice(parsed ? 2 : 1).join(' ');
     if (ms > MAX_TIMEOUT) return say(message, 'Max timeout is 28 days.');
 
-    const problem = targetProblem(message, target);
+    const problem = targetProblem(message, target, 'timeout');
     if (problem) return say(message, problem);
     if (!target.moderatable) {
       return say(message, "I can't time them out. They're an admin or above my role.");
@@ -921,10 +940,13 @@ const HANDLERS = {
     if (isSuper(id) && !isSuper(message.author.id)) {
       return say(message, "You can't use that on a bot admin.");
     }
+    if (isImmune(id, message.guildId, 'ban')) {
+      return say(message, `<@${id}> is whitelisted from \`-ban\`.`);
+    }
 
     const member = await message.guild.members.fetch(id).catch(() => null);
     if (member) {
-      const problem = targetProblem(message, member);
+      const problem = targetProblem(message, member, 'ban');
       if (problem) return say(message, problem);
       if (!member.bannable) return say(message, "I can't ban them. They're above my role.");
     }
@@ -1029,6 +1051,62 @@ const HANDLERS = {
     }
 
     return say(message, 'Usage: `-alias add <name> <command>`, `-alias remove <name>`, `-alias list`');
+  },
+
+  async whitelist(message, args) {
+    const gs = guildState(message.guildId);
+    const userId = idFrom(args.find((a) => idFrom(a)));
+
+    if (!userId) {
+      const entries = Object.entries(gs.immune);
+      if (!entries.length) return info(message, 'Nobody is whitelisted in this server.');
+      return info(message, entries.map(([id, list]) =>
+        `<@${id}>: ${list.includes('all') ? 'everything' : list.map((c) => `\`-${c}\``).join(', ')}`,
+      ).join('\n'));
+    }
+
+    const raw = args.filter((a) => !idFrom(a));
+    const named = raw.map((a) => resolveCommand(message.guildId, a, { includeIndex: true }));
+    const unknown = raw.filter((a, i) => !named[i]);
+    if (unknown.length) return say(message, `Not a command: ${unknown.join(', ')}`);
+
+    const current = gs.immune[userId] ?? [];
+    gs.immune[userId] = named.length
+      ? [...new Set([...current, ...named])]
+      : ['all'];
+    save();
+
+    return ok(message, named.length
+      ? `<@${userId}> is now whitelisted from ${named.map((c) => `\`-${c}\``).join(', ')}.`
+      : `<@${userId}> is now whitelisted from everything.`);
+  },
+
+  async unwhitelist(message, args) {
+    const gs = guildState(message.guildId);
+    const userId = idFrom(args.find((a) => idFrom(a)));
+    if (!userId) return say(message, 'Usage: `-unwhitelist @user [command...]`');
+
+    const current = gs.immune[userId];
+    if (!current?.length) return say(message, `<@${userId}> isn't whitelisted.`);
+
+    const raw = args.filter((a) => !idFrom(a));
+    const named = raw.map((a) => resolveCommand(message.guildId, a, { includeIndex: true }));
+    const unknown = raw.filter((a, i) => !named[i]);
+    if (unknown.length) return say(message, `Not a command: ${unknown.join(', ')}`);
+
+    if (!named.length) {
+      delete gs.immune[userId];
+      save();
+      return ok(message, `<@${userId}> is no longer whitelisted from anything.`);
+    }
+
+    const base = current.includes('all') ? [...COMMANDS, ...INDEX_COMMANDS] : current;
+    const left = base.filter((c) => !named.includes(c));
+    if (left.length) gs.immune[userId] = left;
+    else delete gs.immune[userId];
+    save();
+
+    return ok(message, `<@${userId}> is no longer whitelisted from ${named.map((c) => `\`-${c}\``).join(', ')}.`);
   },
 
   async perms(message, args) {
