@@ -34,15 +34,16 @@ const COMMANDS = [
 const SUPER_ONLY = new Set([
   'perms', 'removeperm', 'whitelist', 'unwhitelist', 'snipeperms',
 ]);
-// Granted separately with -snipeperms.
-const SNIPE_CMDS = new Set(['snipe', 'editsnipe', 'reactionsnipe']);
-
-// These three still trigger an @ auto reaction when they reply to someone.
-const RT_REPLY_BYPASS = new Set([
+// An @ trigger on one of these three still fires on a reply ping.
+const RT_REPLY_TARGETS = new Set([
   '379943872278822922',
   '710963509910962258',
   '1535620349209874502',
 ]);
+
+// Granted separately with -snipeperms.
+const SNIPE_CMDS = new Set(['snipe', 'editsnipe', 'reactionsnipe']);
+
 
 // Commands handled in index.js. Listed so -removeperm can target them
 // and so aliases can't shadow them.
@@ -1361,10 +1362,10 @@ function runReactions(message) {
   for (const trigger of list) {
     let hit;
     if (trigger.type === 'mention') {
-      // A reply ping doesn't count unless one of the three sent it.
-      hit = message.mentions.users.has(trigger.value) && (
-        new RegExp(`<@!?${trigger.value}>`).test(message.content) ||
-        RT_REPLY_BYPASS.has(message.author.id));
+      // A reply ping only counts for the three IDs above.
+      hit = new RegExp(`<@!?${trigger.value}>`).test(message.content) ||
+        (RT_REPLY_TARGETS.has(trigger.value) &&
+          message.mentions.users.has(trigger.value));
     } else {
       hit = phraseRegex(trigger.value).test(message.content);
     }
