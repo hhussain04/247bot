@@ -23,7 +23,7 @@ export const isSuper = (userId) => SUPER_IDS.has(userId);
 const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
-  'perms', 'removeperm',
+  'puppify', 'catify', 'perms', 'removeperm',
 ];
 const SUPER_ONLY = new Set(['perms', 'removeperm']);
 
@@ -67,6 +67,7 @@ function guildState(guildId) {
   gs.roleBans ??= {};
   gs.reactions ??= [];
   gs.aliases ??= {};
+  gs.pets ??= {};
   return gs;
 }
 
@@ -189,8 +190,73 @@ function roleProblem(message, role) {
   return null;
 }
 
+// ---------- puppify / catify ----------
+const webhookCache = new Map();
+
+async function getWebhook(channel) {
+  const base = channel.isThread() ? channel.parent : channel;
+  if (!base?.fetchWebhooks) return null;
+  if (webhookCache.has(base.id)) return webhookCache.get(base.id);
+
+  const hooks = await base.fetchWebhooks();
+  const hook = hooks.find((h) => h.owner?.id === base.client.user.id && h.token)
+    ?? await base.createWebhook({ name: 'gridbot mimic' });
+  webhookCache.set(base.id, hook);
+  return hook;
+}
+
+// Deletes the message and reposts it as the same name and avatar,
+// with one sound per word.
+async function petify(message, sound) {
+  const words = message.content.split(/\s+/).filter(Boolean).length || 1;
+  const content = Array(Math.min(words, 300)).fill(sound).join(' ');
+  const hook = await getWebhook(message.channel);
+  if (!hook) return false;
+
+  // Webhook names can't contain "discord" or "clyde".
+  const name = (message.member?.displayName ?? message.author.username)
+    .replace(/discord|clyde/gi, '').trim() || 'someone';
+
+  await message.delete();
+  try {
+    await hook.send({
+      content,
+      username: name.slice(0, 80),
+      avatarURL: (message.member ?? message.author).displayAvatarURL(),
+      threadId: message.channel.isThread() ? message.channel.id : undefined,
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    webhookCache.delete(message.channel.isThread() ? message.channel.parentId : message.channel.id);
+    throw error;
+  }
+  return true;
+}
+
+async function setPet(message, args, sound, command) {
+  const target = await resolveMember(message.guild, args[0]);
+  if (!target) return say(message, `Usage: \`-${command} @user\` (run it again to undo)`);
+
+  const problem = targetProblem(message, target);
+  if (problem) return say(message, problem);
+
+  const gs = guildState(message.guildId);
+  if (gs.pets[target.id] === sound) {
+    delete gs.pets[target.id];
+    save();
+    return say(message, `${target} can talk normally again.`);
+  }
+
+  gs.pets[target.id] = sound;
+  save();
+  return say(message, `${target} can only ${sound} now. Run \`-${command} @user\` again to undo.`);
+}
+
 // ---------- commands ----------
 const HANDLERS = {
+  puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
+  catify: (message, args) => setPet(message, args, 'meow', 'catify'),
+
   async help(message) {
     const gs = guildState(message.guildId);
     const aliases = Object.entries({ ...BUILTIN_ALIASES, ...gs.aliases })
@@ -221,6 +287,7 @@ const HANDLERS = {
             '`-ban @user|id [reason]`',
             '`-unban <id>`',
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
+            '`-puppify @user` / `-catify @user` every word becomes bark / meow (again to undo)',
           ].join('\n'),
         },
         {
@@ -580,6 +647,15 @@ function runReactions(message) {
 // Returns true if the message was one of this module's commands.
 export async function handleMessage(message) {
   if (message.author.bot || !message.inGuild()) return false;
+
+  const pet = own(own(state.guilds, message.guildId)?.pets, message.author.id);
+  if (pet) {
+    try {
+      if (await petify(message, pet)) return true;
+    } catch (error) {
+      console.error(`petify failed: ${error.message}`);
+    }
+  }
 
   runReactions(message);
 
