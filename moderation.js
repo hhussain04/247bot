@@ -23,7 +23,7 @@ export const isSuper = (userId) => SUPER_IDS.has(userId);
 const COMMANDS = [
   'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
-  'puppify', 'catify', 'perms', 'removeperm',
+  'puppify', 'catify', 'forcenick', 'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
   'setgoodbyechannel', 'changegoodbyechannel', 'removegoodbyebinding',
 ];
@@ -40,6 +40,8 @@ const BUILTIN_ALIASES = {
   r: 'role',
   obliterate: 'ban',
   to: 'timeout',
+  fn: 'forcenick',
+  unfn: 'forcenick',
   commands: 'help',
 };
 
@@ -70,6 +72,7 @@ function guildState(guildId) {
   gs.reactions ??= [];
   gs.aliases ??= {};
   gs.pets ??= {};
+  gs.nicks ??= {};
   return gs;
 }
 
@@ -359,6 +362,36 @@ const HANDLERS = {
   puppify: (message, args) => setPet(message, args, 'bark', 'puppify'),
   catify: (message, args) => setPet(message, args, 'meow', 'catify'),
 
+  async forcenick(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    const nick = args.slice(1).join(' ').trim();
+    if (!target) {
+      return say(message, 'Usage: `-fn @user nickname`, or `-unfn @user` to release it');
+    }
+
+    const problem = targetProblem(message, target);
+    if (problem) return say(message, problem);
+
+    const gs = guildState(message.guildId);
+
+    if (!nick) {
+      if (!gs.nicks[target.id]) return say(message, `${target} isn't force nicked.`);
+      delete gs.nicks[target.id];
+      save();
+      return ok(message, `${target} can change their nickname again.`);
+    }
+
+    if (!target.manageable) {
+      return say(message, "I can't rename them. They're the server owner or above my role.");
+    }
+    if (nick.length > 32) return say(message, 'Nicknames max out at 32 characters.');
+
+    gs.nicks[target.id] = nick;
+    save();
+    await target.setNickname(nick, `forcenick ${by(message)}`);
+    return ok(message, `${target} is now **${nick}** and can't change it.`);
+  },
+
   async help(message) {
     const gs = guildState(message.guildId);
     const aliases = Object.entries({ ...BUILTIN_ALIASES, ...gs.aliases })
@@ -390,6 +423,7 @@ const HANDLERS = {
             '`-unban <id>`',
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
             '`-puppify @user` / `-catify @user` every word becomes bark / meow (again to undo)',
+            '`-fn @user <nickname>` lock their nickname, `-unfn @user` release it',
           ].join('\n'),
         },
         {
@@ -805,10 +839,21 @@ export function attach(client) {
     if (hits.size) await member.roles.remove(hits, 'role banned').catch(() => {});
   };
 
-  client.on('guildMemberUpdate', (_old, member) => { enforce(member); });
+  // Puts a forced nickname back if they or another bot change it.
+  const enforceNick = async (member) => {
+    const locked = own(own(state.guilds, member.guild.id)?.nicks, member.id);
+    if (!locked || member.nickname === locked) return;
+    await member.setNickname(locked, 'forced nickname').catch(() => {});
+  };
+
+  client.on('guildMemberUpdate', (_old, member) => {
+    enforce(member);
+    enforceNick(member);
+  });
   client.on('guildMemberAdd', (member) => {
     sendGreeting(member, 'welcome');
     setTimeout(() => enforce(member), 3_000);
+    setTimeout(() => enforceNick(member), 3_000);
   });
   client.on('guildMemberRemove', (member) => { sendGreeting(member, 'goodbye'); });
 
