@@ -3,3 +3,4 @@ state.json
 node_modules
 vcbot.log
 vcbot*.log
+mod-state.json

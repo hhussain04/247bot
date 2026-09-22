@@ -1,0 +1,617 @@
+// moderation.js: text moderation commands for the 247 bot.
+//
+// Wired into index.js by patch-index.mjs:
+//   import * as mod from './moderation.js';
+//   mod.attach(client);
+//   if (await mod.handleMessage(message)) return;   // inside messageCreate
+
+import fs from 'node:fs';
+import { Colors, EmbedBuilder } from 'discord.js';
+
+const PREFIX = '-';
+
+// Permanent access to every command in every server.
+export const SUPER_IDS = new Set([
+  '379943872278822922',
+  '710963509910962258',
+]);
+if (process.env.OWNER_ID) SUPER_IDS.add(process.env.OWNER_ID);
+
+export const isSuper = (userId) => SUPER_IDS.has(userId);
+
+// Commands handled here.
+const COMMANDS = [
+  'help', 'strip', 'role', 'roleban', 'roleunban', 'rolebans',
+  'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
+  'perms', 'removeperm',
+];
+const SUPER_ONLY = new Set(['perms', 'removeperm']);
+
+// Commands handled in index.js. Listed so -removeperm can target them
+// and so aliases can't shadow them.
+const INDEX_COMMANDS = [
+  'gif', 'reconnect', 'muzzle', 'unmuzzle', 'muzzleembed',
+  'status', 'uptime', 'ping', 'rejoin', 'logs', 'move',
+];
+
+const BUILTIN_ALIASES = {
+  r: 'role',
+  obliterate: 'ban',
+  to: 'timeout',
+  commands: 'help',
+};
+
+// ---------- state ----------
+const STATE_FILE = new URL('./mod-state.json', import.meta.url).pathname;
+
+let state = { guilds: {} };
+try {
+  state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  state.guilds ??= {};
+} catch {
+  // first run
+}
+
+function save() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (error) {
+    console.error(`mod state save failed: ${error.message}`);
+  }
+}
+
+function guildState(guildId) {
+  if (!Object.hasOwn(state.guilds, guildId)) state.guilds[guildId] = {};
+  const gs = state.guilds[guildId];
+  gs.perms ??= {};
+  gs.roleBans ??= {};
+  gs.reactions ??= [];
+  gs.aliases ??= {};
+  return gs;
+}
+
+const own = (obj, key) => (obj && Object.hasOwn(obj, key) ? obj[key] : undefined);
+
+// ---------- access ----------
+export function canUse(userId, guildId, command) {
+  if (isSuper(userId)) return true;
+  if (!guildId || SUPER_ONLY.has(command)) return false;
+  const entry = own(own(state.guilds, guildId)?.perms, userId);
+  return Boolean(entry) && !(entry.denied ?? []).includes(command);
+}
+
+function resolveCommand(guildId, name, { includeIndex = false } = {}) {
+  const key = name?.toLowerCase().replace(/^-+/, '');
+  if (!key) return null;
+  if (COMMANDS.includes(key)) return key;
+  if (includeIndex && INDEX_COMMANDS.includes(key)) return key;
+  return own(own(state.guilds, guildId)?.aliases, key)
+    ?? own(BUILTIN_ALIASES, key)
+    ?? null;
+}
+
+// ---------- helpers ----------
+const say = (message, content) =>
+  message.reply({
+    content: String(content).slice(0, 2000),
+    allowedMentions: { parse: [] },
+  }).catch(() => null);
+
+const by = (message) =>
+  `by ${message.author.username} (${message.author.id})`;
+
+function idFrom(token) {
+  const match = token?.match(/^<@!?(\d{17,20})>$|^(\d{17,20})$/);
+  return match ? (match[1] ?? match[2]) : null;
+}
+
+function resolveMember(guild, token) {
+  const id = idFrom(token);
+  return id ? guild.members.fetch(id).catch(() => null) : null;
+}
+
+function resolveRole(guild, text) {
+  const query = text?.trim();
+  if (!query) return null;
+
+  const id = query.match(/^<@&(\d{17,20})>$|^(\d{17,20})$/);
+  if (id) return guild.roles.cache.get(id[1] ?? id[2]) ?? null;
+
+  const lower = query.toLowerCase();
+  const roles = guild.roles.cache.filter((r) => r.id !== guild.id);
+  const exact = roles.find((r) => r.name.toLowerCase() === lower);
+  if (exact) return exact;
+
+  const partial = roles.filter((r) => r.name.toLowerCase().startsWith(lower));
+  return partial.size === 1 ? partial.first() : null;
+}
+
+function parseColor(input) {
+  const text = input?.trim();
+  if (!text) return null;
+  const hex = text.replace(/^#/, '');
+  if (/^[0-9a-f]{6}$/i.test(hex)) return Number.parseInt(hex, 16);
+  if (text.toLowerCase() === 'random') {
+    return Math.floor(Math.random() * 0xffffff);
+  }
+  const key = Object.keys(Colors)
+    .find((k) => k.toLowerCase() === text.toLowerCase());
+  return key ? Colors[key] : null;
+}
+
+const UNITS = { s: 1e3, m: 60e3, h: 3600e3, d: 86400e3, w: 604800e3 };
+const MAX_TIMEOUT = 28 * 86400e3;
+
+function parseDuration(token) {
+  const match = token?.toLowerCase().match(/^(\d+)(s|m|h|d|w)$/);
+  const ms = match ? Number(match[1]) * UNITS[match[2]] : 0;
+  return ms > 0 ? ms : null;
+}
+
+function phraseRegex(phrase) {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}($|[^\\p{L}\\p{N}_])`, 'iu');
+}
+
+// Returns an error string, or null if the caller may act on the target.
+function targetProblem(message, target) {
+  const callerId = message.author.id;
+  const guild = message.guild;
+  if (target.id === message.client.user.id) return 'Not on me.';
+  if (isSuper(target.id) && !isSuper(callerId)) {
+    return "You can't use that on a bot admin.";
+  }
+  if (isSuper(callerId) || callerId === guild.ownerId) return null;
+  if (
+    target.id === guild.ownerId ||
+    target.roles.highest.position >= message.member.roles.highest.position
+  ) {
+    return 'Their top role is equal to or above yours.';
+  }
+  return null;
+}
+
+function roleProblem(message, role) {
+  const guild = message.guild;
+  const callerId = message.author.id;
+  if (role.id === guild.id) return "That's @everyone.";
+  if (role.managed) return `${role} is managed by an integration.`;
+  if (role.position >= guild.members.me.roles.highest.position) {
+    return `${role} is above my role. Drag my role higher.`;
+  }
+  if (
+    !isSuper(callerId) &&
+    callerId !== guild.ownerId &&
+    role.position >= message.member.roles.highest.position
+  ) {
+    return `${role} is above your top role.`;
+  }
+  return null;
+}
+
+// ---------- commands ----------
+const HANDLERS = {
+  async help(message) {
+    const gs = guildState(message.guildId);
+    const aliases = Object.entries({ ...BUILTIN_ALIASES, ...gs.aliases })
+      .map(([a, c]) => `\`-${a}\` → \`-${c}\``)
+      .join(', ');
+
+    const embed = new EmbedBuilder()
+      .setTitle('Bot commands')
+      .setColor(0x5865f2)
+      .addFields(
+        {
+          name: 'Roles',
+          value: [
+            '`-role add @user <role>` give a role',
+            '`-role remove @user <role>` take a role',
+            '`-role create <color> <name>` color is hex (#ff0000) or a name (red)',
+            '`-strip @user` remove every role I can',
+            '`-roleban @user <role>` stop them ever having a role',
+            '`-roleunban @user <role>` lift a role ban',
+            '`-rolebans @user` list their role bans',
+          ].join('\n'),
+        },
+        {
+          name: 'Moderation',
+          value: [
+            '`-timeout @user [10m] [reason]` s/m/h/d/w, max 28d',
+            '`-untimeout @user`',
+            '`-ban @user|id [reason]`',
+            '`-unban <id>`',
+            '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
+          ].join('\n'),
+        },
+        {
+          name: 'Auto reactions',
+          value: [
+            '`-rt add @user <emoji>` react when they get pinged',
+            '`-rt add <word or phrase> <emoji>` react when it is said',
+            '`-rt list`, `-rt remove <number>`, `-rt clear`',
+          ].join('\n'),
+        },
+        {
+          name: 'Other',
+          value: [
+            '`-alias add <name> <command>`, `-alias remove <name>`, `-alias list`',
+            '`-gif` convert an image or MP4, `-reconnect` rejoin the VC',
+          ].join('\n'),
+        },
+        {
+          name: 'Access (bot admins only)',
+          value: [
+            '`-perms @user` give bot access in this server',
+            '`-perms` list who has access',
+            '`-perms -<command> @user` give back one command',
+            '`-removeperm @user` take all access',
+            '`-removeperm -<command> @user` take one command',
+          ].join('\n'),
+        },
+        { name: 'Aliases', value: (aliases || 'none').slice(0, 1024) },
+      );
+
+    return message.reply({ embeds: [embed], allowedMentions: { parse: [] } });
+  },
+
+  async strip(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return say(message, 'Usage: `-strip @user`');
+
+    const problem = targetProblem(message, target);
+    if (problem) return say(message, problem);
+
+    const all = target.roles.cache.filter((r) => r.id !== message.guild.id);
+    const removable = all.filter((r) => !roleProblem(message, r));
+    if (!removable.size) return say(message, `Nothing on ${target} I can remove.`);
+
+    await target.roles.remove(removable, `strip ${by(message)}`);
+    const kept = all.size - removable.size;
+    return say(
+      message,
+      `Stripped ${removable.size} roles from ${target}.` +
+      (kept ? ` Kept ${kept} that are above me or managed.` : ''),
+    );
+  },
+
+  async role(message, args) {
+    const sub = args[0]?.toLowerCase();
+
+    if (sub === 'create') {
+      const color = parseColor(args[1]);
+      const name = args.slice(2).join(' ').trim();
+      if (color === null || !name) {
+        return say(message, 'Usage: `-role create <color> <name>`, e.g. `-role create #ff0000 Red Team`');
+      }
+      if (name.length > 100) return say(message, 'Role names max out at 100 characters.');
+      const role = await message.guild.roles.create({
+        name, color, reason: `role create ${by(message)}`,
+      });
+      return say(message, `Created ${role}.`);
+    }
+
+    if (sub !== 'add' && sub !== 'remove') {
+      return say(message, 'Usage: `-role add @user <role>`, `-role remove @user <role>`, `-role create <color> <name>`');
+    }
+
+    const target = await resolveMember(message.guild, args[1]);
+    const role = resolveRole(message.guild, args.slice(2).join(' '));
+    if (!target || !role) {
+      return say(message, `Usage: \`-role ${sub} @user <role>\`. Role can be a mention, ID or name.`);
+    }
+
+    const problem = targetProblem(message, target) ?? roleProblem(message, role);
+    if (problem) return say(message, problem);
+
+    if (sub === 'add') {
+      if (guildState(message.guildId).roleBans[target.id]?.includes(role.id)) {
+        return say(message, `${target} is banned from ${role}. Use \`-roleunban\` first.`);
+      }
+      if (target.roles.cache.has(role.id)) return say(message, `${target} already has ${role}.`);
+      await target.roles.add(role, `role add ${by(message)}`);
+      return say(message, `Gave ${role} to ${target}.`);
+    }
+
+    if (!target.roles.cache.has(role.id)) return say(message, `${target} doesn't have ${role}.`);
+    await target.roles.remove(role, `role remove ${by(message)}`);
+    return say(message, `Removed ${role} from ${target}.`);
+  },
+
+  async roleban(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    const role = resolveRole(message.guild, args.slice(1).join(' '));
+    if (!target || !role) return say(message, 'Usage: `-roleban @user <role>`');
+
+    const problem = targetProblem(message, target) ?? roleProblem(message, role);
+    if (problem) return say(message, problem);
+
+    const gs = guildState(message.guildId);
+    const list = (gs.roleBans[target.id] ??= []);
+    if (!list.includes(role.id)) list.push(role.id);
+    save();
+
+    if (target.roles.cache.has(role.id)) {
+      await target.roles.remove(role, `role ban ${by(message)}`);
+    }
+    return say(message, `${target} can no longer have ${role}.`);
+  },
+
+  async roleunban(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    const role = resolveRole(message.guild, args.slice(1).join(' '));
+    if (!target || !role) return say(message, 'Usage: `-roleunban @user <role>`');
+
+    const gs = guildState(message.guildId);
+    const list = gs.roleBans[target.id] ?? [];
+    if (!list.includes(role.id)) return say(message, `${target} wasn't banned from ${role}.`);
+
+    gs.roleBans[target.id] = list.filter((id) => id !== role.id);
+    if (!gs.roleBans[target.id].length) delete gs.roleBans[target.id];
+    save();
+    return say(message, `${target} can have ${role} again.`);
+  },
+
+  async rolebans(message, args) {
+    const id = idFrom(args[0]);
+    if (!id) return say(message, 'Usage: `-rolebans @user`');
+    const list = guildState(message.guildId).roleBans[id] ?? [];
+    if (!list.length) return say(message, `<@${id}> has no role bans.`);
+    return say(message, `<@${id}> is banned from: ${list.map((r) => `<@&${r}>`).join(', ')}`);
+  },
+
+  async timeout(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return say(message, 'Usage: `-timeout @user [10m] [reason]`');
+
+    const parsed = parseDuration(args[1]);
+    const ms = parsed ?? 10 * 60e3;
+    const label = parsed ? args[1] : '10m';
+    const reason = args.slice(parsed ? 2 : 1).join(' ');
+    if (ms > MAX_TIMEOUT) return say(message, 'Max timeout is 28 days.');
+
+    const problem = targetProblem(message, target);
+    if (problem) return say(message, problem);
+    if (!target.moderatable) {
+      return say(message, "I can't time them out. They're an admin or above my role.");
+    }
+
+    await target.timeout(ms, reason ? `${reason} (${by(message)})` : by(message));
+    return say(message, `Timed out ${target} for ${label}.`);
+  },
+
+  async untimeout(message, args) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return say(message, 'Usage: `-untimeout @user`');
+    if (!target.isCommunicationDisabled()) return say(message, `${target} isn't timed out.`);
+    await target.timeout(null, by(message));
+    return say(message, `Removed ${target}'s timeout.`);
+  },
+
+  async ban(message, args) {
+    const id = idFrom(args[0]);
+    if (!id) return say(message, 'Usage: `-ban @user|id [reason]`');
+    const reason = args.slice(1).join(' ');
+
+    if (id === message.client.user.id) return say(message, 'Not on me.');
+    if (isSuper(id) && !isSuper(message.author.id)) {
+      return say(message, "You can't use that on a bot admin.");
+    }
+
+    const member = await message.guild.members.fetch(id).catch(() => null);
+    if (member) {
+      const problem = targetProblem(message, member);
+      if (problem) return say(message, problem);
+      if (!member.bannable) return say(message, "I can't ban them. They're above my role.");
+    }
+
+    await message.guild.members.ban(id, {
+      reason: reason ? `${reason} (${by(message)})` : by(message),
+    });
+    return say(message, `Banned <@${id}>.`);
+  },
+
+  async unban(message, args) {
+    const id = idFrom(args[0]);
+    if (!id) return say(message, 'Usage: `-unban <id>`');
+    await message.guild.members.unban(id, by(message));
+    return say(message, `Unbanned <@${id}>.`);
+  },
+
+  async rt(message, args) {
+    const gs = guildState(message.guildId);
+    const sub = args[0]?.toLowerCase();
+    const describe = (t) => (t.type === 'mention' ? `pings of <@${t.value}>` : `"${t.value}"`);
+
+    if (sub === 'list') {
+      if (!gs.reactions.length) return say(message, 'No auto reactions set.');
+      return say(message, gs.reactions
+        .map((t, i) => `${i + 1}. ${describe(t)} → ${t.emoji}`)
+        .join('\n'));
+    }
+
+    if (sub === 'remove' || sub === 'delete') {
+      const n = Number(args[1]);
+      if (!Number.isInteger(n) || n < 1 || n > gs.reactions.length) {
+        return say(message, 'Usage: `-rt remove <number>` (see `-rt list`)');
+      }
+      const [removed] = gs.reactions.splice(n - 1, 1);
+      save();
+      return say(message, `Removed ${describe(removed)} → ${removed.emoji}.`);
+    }
+
+    if (sub === 'clear') {
+      gs.reactions = [];
+      save();
+      return say(message, 'Cleared all auto reactions.');
+    }
+
+    const rest = sub === 'add' ? args.slice(1) : args;
+    if (rest.length < 2) {
+      return say(message, 'Usage: `-rt add @user <emoji>` or `-rt add <word or phrase> <emoji>`');
+    }
+
+    const emoji = rest[rest.length - 1];
+    const triggerText = rest.slice(0, -1).join(' ');
+    const mention = triggerText.match(/^<@!?(\d{17,20})>$/);
+    const trigger = mention
+      ? { type: 'mention', value: mention[1], emoji }
+      : { type: 'phrase', value: triggerText.toLowerCase(), emoji };
+
+    // Reacting to the command message checks the emoji is usable here.
+    const usable = await message.react(emoji).then(() => true).catch(() => false);
+    if (!usable) {
+      return say(message, "I can't use that emoji. Use a default one or one from this server.");
+    }
+
+    const exists = gs.reactions.some((t) =>
+      t.type === trigger.type && t.value === trigger.value && t.emoji === emoji);
+    if (exists) return say(message, 'That auto reaction already exists.');
+
+    gs.reactions.push(trigger);
+    save();
+    return say(message, `Added: ${describe(trigger)} → ${emoji}`);
+  },
+
+  async alias(message, args) {
+    const gs = guildState(message.guildId);
+    const sub = args[0]?.toLowerCase();
+
+    if (!sub || sub === 'list') {
+      const lines = Object.entries({ ...BUILTIN_ALIASES, ...gs.aliases })
+        .map(([a, c]) => `\`-${a}\` → \`-${c}\`${own(gs.aliases, a) ? '' : ' (built in)'}`);
+      return say(message, lines.join('\n') || 'No aliases.');
+    }
+
+    if (sub === 'add') {
+      const name = args[1]?.toLowerCase().replace(/^-+/, '');
+      const target = resolveCommand(message.guildId, args[2]);
+      if (!name || !target) return say(message, 'Usage: `-alias add <name> <command>`, e.g. `-alias add b ban`');
+      if (!/^[a-z0-9_]{1,20}$/.test(name)) return say(message, 'Alias names are letters, numbers and _ only.');
+      if (COMMANDS.includes(name) || INDEX_COMMANDS.includes(name) || own(BUILTIN_ALIASES, name)) {
+        return say(message, `\`-${name}\` is already a command.`);
+      }
+      gs.aliases[name] = target;
+      save();
+      return say(message, `\`-${name}\` now runs \`-${target}\`.`);
+    }
+
+    if (sub === 'remove' || sub === 'delete') {
+      const name = args[1]?.toLowerCase().replace(/^-+/, '');
+      if (!name || !own(gs.aliases, name)) return say(message, "That alias doesn't exist (built in ones can't be removed).");
+      delete gs.aliases[name];
+      save();
+      return say(message, `Removed \`-${name}\`.`);
+    }
+
+    return say(message, 'Usage: `-alias add <name> <command>`, `-alias remove <name>`, `-alias list`');
+  },
+
+  async perms(message, args) {
+    const gs = guildState(message.guildId);
+    const flag = args.find((a) => a.startsWith('-'));
+    const userId = idFrom(args.find((a) => idFrom(a)));
+
+    if (!userId) {
+      const entries = Object.entries(gs.perms);
+      if (!entries.length) return say(message, 'Nobody has bot access in this server yet.');
+      return say(message, entries.map(([id, e]) => {
+        const denied = e.denied?.length
+          ? ` (blocked: ${e.denied.map((c) => `-${c}`).join(', ')})`
+          : '';
+        return `<@${id}>${denied}`;
+      }).join('\n'));
+    }
+
+    if (isSuper(userId)) return say(message, `<@${userId}> already has permanent access.`);
+
+    if (flag) {
+      const cmd = resolveCommand(message.guildId, flag, { includeIndex: true });
+      if (!cmd) return say(message, `\`${flag}\` isn't a command.`);
+      const entry = own(gs.perms, userId);
+      if (!entry) return say(message, `<@${userId}> has no bot access here. Run \`-perms @user\` first.`);
+      entry.denied = (entry.denied ?? []).filter((c) => c !== cmd);
+      save();
+      return say(message, `<@${userId}> can use \`-${cmd}\` again.`);
+    }
+
+    gs.perms[userId] = { denied: [] };
+    save();
+    return say(message, `<@${userId}> now has full bot access in this server.`);
+  },
+
+  async removeperm(message, args) {
+    const gs = guildState(message.guildId);
+    const flag = args.find((a) => a.startsWith('-'));
+    const userId = idFrom(args.find((a) => idFrom(a)));
+    if (!userId) return say(message, 'Usage: `-removeperm @user` or `-removeperm -<command> @user`');
+    if (isSuper(userId)) return say(message, `<@${userId}> has permanent access and can't be removed.`);
+
+    const entry = own(gs.perms, userId);
+    if (!entry) return say(message, `<@${userId}> has no bot access here.`);
+
+    if (flag) {
+      const cmd = resolveCommand(message.guildId, flag, { includeIndex: true });
+      if (!cmd) return say(message, `\`${flag}\` isn't a command.`);
+      entry.denied = [...new Set([...(entry.denied ?? []), cmd])];
+      save();
+      return say(message, `<@${userId}> can no longer use \`-${cmd}\`.`);
+    }
+
+    delete gs.perms[userId];
+    save();
+    return say(message, `<@${userId}> no longer has bot access here.`);
+  },
+};
+
+// ---------- auto reactions ----------
+function runReactions(message) {
+  const list = own(state.guilds, message.guildId)?.reactions;
+  if (!list?.length) return;
+  for (const trigger of list) {
+    const hit = trigger.type === 'mention'
+      ? message.mentions.users.has(trigger.value)
+      : phraseRegex(trigger.value).test(message.content);
+    if (hit) message.react(trigger.emoji).catch(() => {});
+  }
+}
+
+// ---------- entry points ----------
+
+// Returns true if the message was one of this module's commands.
+export async function handleMessage(message) {
+  if (message.author.bot || !message.inGuild()) return false;
+
+  runReactions(message);
+
+  if (!message.content.startsWith(PREFIX)) return false;
+  const [head, ...args] = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const name = resolveCommand(message.guildId, head);
+  if (!name || !COMMANDS.includes(name)) return false;
+
+  if (!canUse(message.author.id, message.guildId, name)) {
+    await say(message, SUPER_ONLY.has(name) ? 'Only bot admins can do that.' : 'Not for you.');
+    return true;
+  }
+
+  try {
+    await HANDLERS[name](message, args);
+  } catch (error) {
+    await say(message, `That failed: ${error.message}`);
+  }
+  return true;
+}
+
+// Enforces role bans when anything else hands out a banned role.
+export function attach(client) {
+  const enforce = async (member) => {
+    const banned = own(own(state.guilds, member.guild.id)?.roleBans, member.id);
+    if (!banned?.length) return;
+    const hits = member.roles.cache.filter((r) => banned.includes(r.id));
+    if (hits.size) await member.roles.remove(hits, 'role banned').catch(() => {});
+  };
+
+  client.on('guildMemberUpdate', (_old, member) => { enforce(member); });
+  client.on('guildMemberAdd', (member) => {
+    setTimeout(() => enforce(member), 3_000);
+  });
+}

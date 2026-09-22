@@ -25,6 +25,7 @@ import {
 } from '@discordjs/voice';
 
 import * as football from './football.js';
+import * as mod from './moderation.js';
 
 // ---------- config ----------
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -126,6 +127,7 @@ let disconnectAlertSent = false;
 const log = (message) => {
   const line = `[${new Date().toISOString()}] ${message}`;
   console.log(line);
+  fs.appendFile(LOG_FILE, line + '\n', () => {});
 };
 
 const fmtDuration = (milliseconds) => {
@@ -155,6 +157,8 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // privileged — enable Server Members Intent
   ],
 });
+
+mod.attach(client);
 
 // ---------- owner notification ----------
 async function notifyOwner(message) {
@@ -770,6 +774,8 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  if (await mod.handleMessage(message)) return;
+
   const command = message.content.trim().toLowerCase();
 
   const isMuzzleCommand =
@@ -785,9 +791,11 @@ client.on('messageCreate', async (message) => {
 
   if (!isKnownTextCommand) return;
 
-  const isOwner = message.author.id === OWNER_ID;
+  const isOwner = mod.isSuper(message.author.id);
   const hasBotPermission =
-    isOwner || permittedUserIds.has(message.author.id);
+    isOwner ||
+    permittedUserIds.has(message.author.id) ||
+    mod.canUse(message.author.id, message.guildId, command.slice(1).split(/\s+/)[0]);
 
   if (!hasBotPermission) {
     await message.reply('Not for you.').catch(() => {});
@@ -867,14 +875,12 @@ client.on('messageCreate', async (message) => {
     const wasMuzzled = muzzledUserIds.delete(target.id);
     saveState();
 
-    await message.reply(
-      wasMuzzled
+    await message.reply({
+      content: wasMuzzled
         ? `${target} is no longer muzzled.`
         : `${target} was not muzzled.`,
-      {
-        allowedMentions: { parse: [] },
-      },
-    ).catch(() => {});
+      allowedMentions: { parse: [] },
+    }).catch(() => {});
 
     return;
   }
@@ -1102,9 +1108,11 @@ client.on('interactionCreate', async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
-  const isOwner = interaction.user.id === OWNER_ID;
+  const isOwner = mod.isSuper(interaction.user.id);
   const hasBotPermission =
-    isOwner || permittedUserIds.has(interaction.user.id);
+    isOwner ||
+    permittedUserIds.has(interaction.user.id) ||
+    mod.canUse(interaction.user.id, interaction.guildId, interaction.commandName);
 
   if (!hasBotPermission) {
     return interaction.reply({
