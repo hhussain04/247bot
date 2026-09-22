@@ -132,6 +132,8 @@ function resolveCommand(guildId, name, { includeIndex = false } = {}) {
   if (!key) return null;
   if (COMMANDS.includes(key)) return key;
   if (includeIndex && INDEX_COMMANDS.includes(key)) return key;
+  // Phrase commands can be whitelisted by name too.
+  if (includeIndex && own(state.guilds[guildId]?.phrases, key)) return key;
   return own(own(state.guilds, guildId)?.aliases, key)
     ?? own(BUILTIN_ALIASES, key)
     ?? null;
@@ -943,6 +945,7 @@ const HANDLERS = {
             '`-removeperm @user` take all access',
             '`-removeperm -<command> @user` take one command',
             '`-whitelist @user [commands]` make the bot ignore them (`-wl`)',
+            'e.g. `-wl @user goon iluvalli`, or `-wl @user say` for every phrase',
             '`-unwhitelist @user [commands]` undo it (`-unwl`)',
           ].join('\n'),
         },
