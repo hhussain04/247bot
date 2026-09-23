@@ -25,7 +25,7 @@ const COMMANDS = [
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
   'copychannelperms', 'purge', 'bc', 'whitelist', 'unwhitelist',
-  'say', 'phrase',
+  'say', 'phrase', 'imute', 'iunmute', 'rmute', 'runmute',
   'snipe', 'editsnipe', 'reactionsnipe', 'clearsnipe', 'snipeperms',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
@@ -56,6 +56,10 @@ const BUILTIN_ALIASES = {
   r: 'role',
   obliterate: 'ban',
   to: 'timeout',
+  mute: 'timeout',
+  unmute: 'untimeout',
+  unimute: 'iunmute',
+  unrmute: 'runmute',
   fn: 'forcenick',
   unfn: 'forcenick',
   l: 'lock',
@@ -105,6 +109,8 @@ function guildState(guildId) {
   gs.immune ??= {};
   gs.snipers ??= {};
   gs.phrases ??= {};
+  gs.muteRoles ??= {};
+  gs.mutes ??= [];
   return gs;
 }
 
@@ -507,6 +513,73 @@ async function purge(message, args, forced) {
   return null;
 }
 
+// ---------- image and reaction mutes ----------
+// Same approach as bleed: a dedicated role denied the permission in every channel.
+const MUTE_ROLES = {
+  image: { name: 'Image Muted', deny: ['AttachFiles', 'EmbedLinks'], verb: 'image muted' },
+  reaction: { name: 'Reaction Muted', deny: ['AddReactions'], verb: 'reaction muted' },
+};
+
+async function ensureMuteRole(guild, kind) {
+  const gs = guildState(guild.id);
+  const { name, deny } = MUTE_ROLES[kind];
+
+  let role = gs.muteRoles[kind] ? guild.roles.cache.get(gs.muteRoles[kind]) : null;
+  role ??= guild.roles.cache.find((r) => r.name === name);
+  role ??= await guild.roles.create({ name, reason: `${name} role` });
+
+  gs.muteRoles[kind] = role.id;
+  save();
+
+  const denied = Object.fromEntries(deny.map((p) => [p, false]));
+  for (const channel of guild.channels.cache.values()) {
+    if (channel.isThread?.()) continue;
+    const overwrite = channel.permissionOverwrites?.cache.get(role.id);
+    if (overwrite && deny.every((p) => overwrite.deny.has(PermissionFlagsBits[p]))) continue;
+    if (!channel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageRoles)) continue;
+    await channel.permissionOverwrites.edit(role.id, denied, { reason: `${name} role` })
+      .catch(() => {});
+  }
+  return role;
+}
+
+async function setMute(message, args, kind, muting) {
+  const command = `${kind === 'image' ? 'i' : 'r'}mute`;
+  const target = await resolveMember(message.guild, args[0]);
+  if (!target) {
+    return say(message, `Usage: \`-${muting ? command : command.replace('mute', 'unmute')} @user${muting ? ' [10m] [reason]' : ''}\``);
+  }
+
+  const problem = targetProblem(message, target, command);
+  if (problem) return say(message, problem);
+
+  const role = await ensureMuteRole(message.guild, kind);
+  if (role.position >= message.guild.members.me.roles.highest.position) {
+    return say(message, `${role} is above my role. Drag my role higher.`);
+  }
+
+  const gs = guildState(message.guildId);
+  gs.mutes = gs.mutes.filter((m) => !(m.userId === target.id && m.kind === kind));
+
+  if (!muting) {
+    if (!target.roles.cache.has(role.id)) {
+      return say(message, `${target} isn't ${MUTE_ROLES[kind].verb}.`);
+    }
+    await target.roles.remove(role, `un${command} ${by(message)}`);
+    save();
+    return ok(message, `${target} is no longer ${MUTE_ROLES[kind].verb}.`);
+  }
+
+  const ms = parseDuration(args[1]);
+  const reason = args.slice(ms ? 2 : 1).join(' ');
+  await target.roles.add(role, reason ? `${reason} (${by(message)})` : by(message));
+
+  if (ms) gs.mutes.push({ userId: target.id, kind, until: Date.now() + ms });
+  save();
+
+  return ok(message, `${target} is now ${MUTE_ROLES[kind].verb}${ms ? ` for ${args[1]}` : ''}.`);
+}
+
 // ---------- channel lock ----------
 const SEND = PermissionFlagsBits.SendMessages;
 const SEND_THREADS = PermissionFlagsBits.SendMessagesInThreads;
@@ -830,6 +903,11 @@ const HANDLERS = {
     return ok(message, `Copied ${from}'s permissions in ${channel} to ${to}.`);
   },
 
+  imute: (message, args) => setMute(message, args, 'image', true),
+  iunmute: (message, args) => setMute(message, args, 'image', false),
+  rmute: (message, args) => setMute(message, args, 'reaction', true),
+  runmute: (message, args) => setMute(message, args, 'reaction', false),
+
   lock: (message) => setLock(message, true),
   unlock: (message) => setLock(message, false),
 
@@ -889,7 +967,9 @@ const HANDLERS = {
           name: 'Moderation',
           value: [
             '`-timeout @user [10m] [reason]` s/m/h/d/w, max 28d',
-            '`-untimeout @user`',
+            '`-untimeout @user`, `-mute` and `-unmute` do the same',
+            '`-imute @user [10m]` block images and links, `-iunmute @user`',
+            '`-rmute @user [10m]` block reactions, `-runmute @user`',
             '`-ban @user|id [reason]`',
             '`-unban <id>`',
             '`-muzzle @user` / `-unmuzzle @user` delete everything they send',
@@ -1494,6 +1574,25 @@ export function attach(client) {
   client.on('inviteDelete', (invite) => { cacheInvites(invite.guild); });
   client.on('guildCreate', (guild) => { cacheInvites(guild); });
   client.on('guildMemberRemove', (member) => { sendGreeting(member, 'goodbye'); });
+
+  // Lift timed image and reaction mutes.
+  setInterval(async () => {
+    for (const [guildId, gs] of Object.entries(state.guilds)) {
+      const due = (gs.mutes ?? []).filter((m) => m.until <= Date.now());
+      if (!due.length) continue;
+
+      gs.mutes = gs.mutes.filter((m) => m.until > Date.now());
+      save();
+
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) continue;
+      for (const mute of due) {
+        const roleId = gs.muteRoles?.[mute.kind];
+        const member = roleId ? await guild.members.fetch(mute.userId).catch(() => null) : null;
+        await member?.roles.remove(roleId, 'mute expired').catch(() => {});
+      }
+    }
+  }, 30_000);
 
   // Leave events only fire for cached members, so cache everyone on start.
   client.once('clientReady', () => {
