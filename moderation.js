@@ -25,7 +25,7 @@ const COMMANDS = [
   'timeout', 'untimeout', 'ban', 'unban', 'rt', 'alias',
   'puppify', 'catify', 'goon', 'forcenick', 'lock', 'unlock', 'invitedby',
   'copychannelperms', 'purge', 'bc', 'whitelist', 'unwhitelist',
-  'say', 'phrase', 'imute', 'iunmute', 'rmute', 'runmute',
+  'say', 'phrase', 'imute', 'iunmute', 'rmute', 'runmute', 'forceng',
   'snipe', 'editsnipe', 'reactionsnipe', 'clearsnipe', 'snipeperms',
   'perms', 'removeperm',
   'setwelcomechannel', 'changewelcomechannel', 'removewelcomebinding',
@@ -65,6 +65,7 @@ const BUILTIN_ALIASES = {
   l: 'lock',
   ul: 'unlock',
   ccp: 'copychannelperms',
+  forceenglish: 'forceng',
   c: 'purge',
   s: 'snipe',
   es: 'editsnipe',
@@ -111,6 +112,7 @@ function guildState(guildId) {
   gs.phrases ??= {};
   gs.muteRoles ??= {};
   gs.mutes ??= [];
+  gs.english ??= [];
   return gs;
 }
 
@@ -908,6 +910,20 @@ const HANDLERS = {
   rmute: (message, args) => setMute(message, args, 'reaction', true),
   runmute: (message, args) => setMute(message, args, 'reaction', false),
 
+  async forceng(message) {
+    const gs = guildState(message.guildId);
+    const on = gs.english.includes(message.channelId);
+
+    gs.english = on
+      ? gs.english.filter((id) => id !== message.channelId)
+      : [...gs.english, message.channelId];
+    save();
+
+    return ok(message, on
+      ? `No longer translating ${message.channel}.`
+      : `Anything not in English in ${message.channel} will be translated underneath.`);
+  },
+
   lock: (message) => setLock(message, true),
   unlock: (message) => setLock(message, false),
 
@@ -981,6 +997,7 @@ const HANDLERS = {
             '`-purge 20`, `-purge @user 20`, `-purge bot 20`, `-purge image|video|gif 20` (`-c`, `-bc`)',
             '`-fn @user <nickname>` lock their nickname, `-unfn @user` release it',
             '`-lock` / `-unlock` this channel, admins can still talk (`-l` / `-ul`)',
+            '`-forceng` translate anything not in English in this channel, run again to stop',
             '`-copychannelperms @from @to` copy one role\'s channel permissions onto another (`-ccp`)',
           ].join('\n'),
         },
@@ -1426,6 +1443,56 @@ const HANDLERS = {
   },
 };
 
+// ---------- forced english ----------
+// Google's public gtx endpoint, no key needed.
+const LANGS = new Intl.DisplayNames(['en'], { type: 'language' });
+
+async function translate(text) {
+  const url = 'https://translate.googleapis.com/translate_a/single' +
+    `?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(text)}`;
+
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) {
+    console.error(`translate failed: HTTP ${response.status}`);
+    return null;
+  }
+
+  const data = await response.json();
+  const translated = (data[0] ?? []).map((part) => part[0] ?? '').join('').trim();
+  return translated ? { text: translated, source: data[2] } : null;
+}
+
+async function runEnglish(message) {
+  if (!state.guilds[message.guildId]?.english?.includes(message.channelId)) return;
+  if (message.content.startsWith(PREFIX)) return;
+
+  // Ignore mentions, emojis, links and anything too short to be a sentence.
+  const stripped = message.content
+    .replace(/<a?:\w+:\d+>|<[@#][!&]?\d+>|https?:\/\/\S+/g, ' ')
+    .trim();
+  if (stripped.replace(/[^\p{L}]/gu, '').length < 3) return;
+  if (stripped.length > 1_000) return;
+
+  const result = await translate(stripped).catch(() => null);
+  if (!result || result.source === 'en') return;
+  if (result.text.toLowerCase() === stripped.toLowerCase()) return;
+
+  let language = result.source;
+  try {
+    language = LANGS.of(result.source) ?? result.source;
+  } catch {
+    // unknown code, keep it as is
+  }
+
+  await message.reply({
+    content: `**${language}:** ${result.text}`.slice(0, 2000),
+    allowedMentions: { parse: [], repliedUser: false },
+  }).catch(() => {});
+}
+
 // ---------- auto reactions ----------
 // Anyone saying w/l in this channel gets a thumbs up and thumbs down.
 const WL_CHANNEL = '1551973120854855700';
@@ -1469,6 +1536,7 @@ export async function handleMessage(message) {
   }
 
   runWl(message);
+  runEnglish(message);
   runReactions(message);
 
   if (!message.content.startsWith(PREFIX)) return false;
