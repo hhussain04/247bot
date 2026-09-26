@@ -47,8 +47,8 @@ for (const [key, value] of Object.entries({
   }
 }
 
-// State persists across restarts.
-let channelId = process.env.CHANNEL_ID;
+// State persists across restarts. One voice channel per guild.
+let channels = {};
 
 const DEFAULT_MUZZLE_EMBED = Object.freeze({
   title: 'Message removed',
@@ -70,7 +70,11 @@ try {
     fs.readFileSync(STATE_FILE, 'utf8'),
   );
 
-  channelId = savedState.channelId ?? channelId;
+  if (savedState.channels && typeof savedState.channels === 'object') {
+    channels = { ...savedState.channels };
+  } else if (savedState.channelId) {
+    channels[GUILD_ID] = savedState.channelId;
+  }
 
   if (Array.isArray(savedState.permittedUserIds)) {
     permittedUserIds = new Set(savedState.permittedUserIds);
@@ -93,7 +97,11 @@ try {
   // No saved state yet.
 }
 
-if (!channelId) {
+if (!channels[GUILD_ID] && process.env.CHANNEL_ID) {
+  channels[GUILD_ID] = process.env.CHANNEL_ID;
+}
+
+if (!Object.keys(channels).length) {
   console.error('missing env: CHANNEL_ID');
   process.exit(1);
 }
@@ -103,7 +111,7 @@ const saveState = () => {
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify({
-        channelId,
+        channels,
         permittedUserIds: [...permittedUserIds],
         muzzledUserIds: [...muzzledUserIds],
         muzzleEmbedConfig,
@@ -117,12 +125,21 @@ const saveState = () => {
 // ---------- stats ----------
 const startedAt = Date.now();
 
-let reconnects = 0;
-let lastReconnect = null;
-let connectInProgress = false;
+// One set of counters per guild.
+const voiceStats = new Map();
 
-let disconnectedSince = null;
-let disconnectAlertSent = false;
+const statsFor = (guildId) => {
+  if (!voiceStats.has(guildId)) {
+    voiceStats.set(guildId, {
+      reconnects: 0,
+      lastReconnect: null,
+      connecting: false,
+      disconnectedSince: null,
+      alerted: false,
+    });
+  }
+  return voiceStats.get(guildId);
+};
 
 const log = (message) => {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -173,17 +190,18 @@ async function notifyOwner(message) {
 }
 
 // ---------- voice ----------
-function isActuallyInVoice() {
-  const guild = client.guilds.cache.get(GUILD_ID);
+function isActuallyInVoice(guildId) {
+  const guild = client.guilds.cache.get(guildId);
+  const channelId = channels[guildId];
 
   return Boolean(
-    guild?.members.me?.voice?.channelId &&
-    guild.members.me.voice.channelId === channelId
+    channelId &&
+    guild?.members.me?.voice?.channelId === channelId
   );
 }
 
-function destroyCurrentConnection() {
-  const connection = getVoiceConnection(GUILD_ID);
+function destroyConnection(guildId) {
+  const connection = getVoiceConnection(guildId);
 
   if (connection) {
     try {
@@ -194,18 +212,23 @@ function destroyCurrentConnection() {
   }
 }
 
-async function connect({ force = false } = {}) {
-  if (connectInProgress && !force) {
-    log('connect already in progress');
+async function connect(guildId, { force = false } = {}) {
+  const channelId = channels[guildId];
+  if (!channelId) return null;
+
+  const stats = statsFor(guildId);
+
+  if (stats.connecting && !force) {
+    log(`connect already in progress in ${guildId}`);
     return null;
   }
 
-  connectInProgress = true;
+  stats.connecting = true;
 
   try {
     const guild =
-      client.guilds.cache.get(GUILD_ID) ??
-      await client.guilds.fetch(GUILD_ID);
+      client.guilds.cache.get(guildId) ??
+      await client.guilds.fetch(guildId);
 
     const voiceChannel = await guild.channels.fetch(channelId);
 
@@ -214,10 +237,10 @@ async function connect({ force = false } = {}) {
     }
 
     if (force) {
-      destroyCurrentConnection();
+      destroyConnection(guildId);
     }
 
-    const existing = getVoiceConnection(GUILD_ID);
+    const existing = getVoiceConnection(guildId);
 
     if (
       existing &&
@@ -228,41 +251,33 @@ async function connect({ force = false } = {}) {
 
     const connection = joinVoiceChannel({
       channelId,
-      guildId: GUILD_ID,
+      guildId,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
       selfMute: true,
     });
 
     connection.on(VoiceConnectionStatus.Ready, () => {
-      disconnectedSince = null;
-      disconnectAlertSent = false;
-      log(`voice ready in ${channelId}`);
+      stats.disconnectedSince = null;
+      stats.alerted = false;
+      log(`voice ready in ${channelId} (${guild.name})`);
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      log('voice connection entered Disconnected state');
+      log(`voice connection entered Disconnected state in ${guild.name}`);
 
       try {
         await Promise.race([
-          entersState(
-            connection,
-            VoiceConnectionStatus.Signalling,
-            5_000,
-          ),
-          entersState(
-            connection,
-            VoiceConnectionStatus.Connecting,
-            5_000,
-          ),
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
 
-        log('voice resumed after transient disconnect');
+        log(`voice resumed after transient disconnect in ${guild.name}`);
       } catch {
-        reconnects++;
-        lastReconnect = Date.now();
+        stats.reconnects++;
+        stats.lastReconnect = Date.now();
 
-        log(`hard disconnect — rejoining (reconnect #${reconnects})`);
+        log(`hard disconnect in ${guild.name} — rejoining (reconnect #${stats.reconnects})`);
 
         try {
           connection.destroy();
@@ -271,7 +286,7 @@ async function connect({ force = false } = {}) {
         }
 
         setTimeout(() => {
-          connect().catch((error) => {
+          connect(guildId).catch((error) => {
             log(`delayed reconnect failed: ${error.message}`);
           });
         }, 2_000);
@@ -279,82 +294,92 @@ async function connect({ force = false } = {}) {
     });
 
     connection.on('error', (error) => {
-      log(`voice error: ${error.message}`);
+      log(`voice error in ${guild.name}: ${error.message}`);
     });
 
     return connection;
   } catch (error) {
-    log(`connect failed: ${error.message}`);
+    log(`connect failed in ${guildId}: ${error.message}`);
 
     setTimeout(() => {
-      connect().catch((retryError) => {
+      connect(guildId).catch((retryError) => {
         log(`connect retry failed: ${retryError.message}`);
       });
     }, 10_000);
 
     return null;
   } finally {
-    connectInProgress = false;
+    stats.connecting = false;
   }
 }
 
-async function forceReconnect(reason = 'manual reconnect') {
-  reconnects++;
-  lastReconnect = Date.now();
+async function connectAll() {
+  for (const guildId of Object.keys(channels)) {
+    await connect(guildId);
+  }
+}
 
-  log(`${reason} (reconnect #${reconnects})`);
+async function forceReconnect(guildId, reason = 'manual reconnect') {
+  const stats = statsFor(guildId);
 
-  destroyCurrentConnection();
+  stats.reconnects++;
+  stats.lastReconnect = Date.now();
+
+  log(`${reason} in ${guildId} (reconnect #${stats.reconnects})`);
+
+  destroyConnection(guildId);
 
   await new Promise((resolve) => setTimeout(resolve, 750));
-  await connect({ force: true });
+  await connect(guildId, { force: true });
 }
 
 // Check frequently enough to detect a genuine ten-second absence.
 setInterval(async () => {
   if (!client.isReady()) return;
 
-  const inVoice = isActuallyInVoice();
+  for (const guildId of Object.keys(channels)) {
+    const stats = statsFor(guildId);
 
-  if (inVoice) {
-    disconnectedSince = null;
-    disconnectAlertSent = false;
-    return;
-  }
+    if (isActuallyInVoice(guildId)) {
+      stats.disconnectedSince = null;
+      stats.alerted = false;
+      continue;
+    }
 
-  if (!disconnectedSince) {
-    disconnectedSince = Date.now();
-    log('watchdog: bot is not in the configured voice channel');
-  }
+    if (!stats.disconnectedSince) {
+      stats.disconnectedSince = Date.now();
+      log(`watchdog: not in the configured voice channel in ${guildId}`);
+    }
 
-  const disconnectedFor = Date.now() - disconnectedSince;
+    if (Date.now() - stats.disconnectedSince >= 10_000 && !stats.alerted) {
+      stats.alerted = true;
 
-  if (disconnectedFor >= 10_000 && !disconnectAlertSent) {
-    disconnectAlertSent = true;
+      const name = client.guilds.cache.get(guildId)?.name ?? guildId;
 
-    await notifyOwner(
-      [
-        `<@${OWNER_ID}> the 24/7 bot has been outside its configured VC`,
-        `<#${channelId}> for at least **10 seconds**.`,
-        `I am attempting to reconnect automatically.`,
-      ].join('\n'),
-    );
-  }
+      await notifyOwner(
+        [
+          `<@${OWNER_ID}> the 24/7 bot has been outside its configured VC`,
+          `<#${channels[guildId]}> in **${name}** for at least **10 seconds**.`,
+          `I am attempting to reconnect automatically.`,
+        ].join('\n'),
+      );
+    }
 
-  const connection = getVoiceConnection(GUILD_ID);
+    const connection = getVoiceConnection(guildId);
 
-  if (
-    !connection ||
-    connection.state.status === VoiceConnectionStatus.Destroyed
-  ) {
-    reconnects++;
-    lastReconnect = Date.now();
+    if (
+      !connection ||
+      connection.state.status === VoiceConnectionStatus.Destroyed
+    ) {
+      stats.reconnects++;
+      stats.lastReconnect = Date.now();
 
-    log(`watchdog reconnect attempt #${reconnects}`);
+      log(`watchdog reconnect attempt #${stats.reconnects} in ${guildId}`);
 
-    await connect().catch((error) => {
-      log(`watchdog reconnect failed: ${error.message}`);
-    });
+      await connect(guildId).catch((error) => {
+        log(`watchdog reconnect failed: ${error.message}`);
+      });
+    }
   }
 }, 2_000);
 
@@ -870,8 +895,8 @@ client.on('messageCreate', async (message) => {
     const reply = await message.reply('Reconnecting...');
 
     try {
-      await forceReconnect('owner used -reconnect');
-      await reply.edit(`Reconnected to <#${channelId}>.`);
+      await forceReconnect(message.guildId, 'owner used -reconnect');
+      await reply.edit(`Reconnected to <#${channels[message.guildId]}>.`);
     } catch (error) {
       log(`-reconnect failed: ${error.message}`);
       await reply.edit(`Reconnect failed: ${error.message}`);
@@ -957,6 +982,10 @@ const commands = [
         .addChannelTypes(ChannelType.GuildVoice)
         .setRequired(true),
     ),
+  new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('Leave this server\'s voice channel and stop rejoining it'),
+
   new SlashCommandBuilder()
     .setName('perms')
     .setDescription('Grant, revoke, or list bot access')
@@ -1059,15 +1088,17 @@ const allCommands = [...commands, ...football.commands];
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
 
-  await rest.put(
-    Routes.applicationGuildCommands(APP_ID, GUILD_ID),
-    { body: allCommands },
-  );
-
-  log(
-    `registered ${allCommands.length} slash commands ` +
-    `(${football.commands.length} from football)`,
-  );
+  // Football only belongs in its own server; the rest go everywhere.
+  for (const guild of client.guilds.cache.values()) {
+    const body = guild.id === GUILD_ID ? allCommands : commands;
+    await rest.put(
+      Routes.applicationGuildCommands(APP_ID, guild.id),
+      { body },
+    ).catch((error) => {
+      log(`command registration failed in ${guild.id}: ${error.message}`);
+    });
+    log(`registered ${body.length} slash commands in ${guild.name}`);
+  }
 }
 
 client.on('interactionCreate', async (interaction) => {
@@ -1113,8 +1144,8 @@ client.on('interactionCreate', async (interaction) => {
     });
   }
 
-  const connection = getVoiceConnection(GUILD_ID);
-  const state = connection?.state.status ?? 'none';
+  const connection = getVoiceConnection(interaction.guildId);
+  const voiceState = connection?.state.status ?? 'none';
 
   try {
     switch (interaction.commandName) {
@@ -1137,27 +1168,42 @@ client.on('interactionCreate', async (interaction) => {
 
         const load = os.loadavg()[0].toFixed(2);
 
-        const lastReconnectText = lastReconnect
-          ? `${fmtDuration(Date.now() - lastReconnect)} ago`
+        const guildStats = statsFor(interaction.guildId);
+        const here = channels[interaction.guildId];
+
+        const lastReconnectText = guildStats.lastReconnect
+          ? `${fmtDuration(Date.now() - guildStats.lastReconnect)} ago`
           : 'never';
 
+        const elsewhere = Object.entries(channels)
+          .filter(([guildId]) => guildId !== interaction.guildId)
+          .map(([guildId, id]) =>
+            `${client.guilds.cache.get(guildId)?.name ?? guildId}: ${id}`);
+
         return interaction.reply([
-          `**Voice:** \`${state}\` in <#${channelId}>`,
-          `**Actually in VC:** ${isActuallyInVoice() ? 'yes' : 'no'}`,
+          `**Voice:** \`${voiceState}\` in ${here ? `<#${here}>` : 'no channel set here'}`,
+          `**Actually in VC:** ${isActuallyInVoice(interaction.guildId) ? 'yes' : 'no'}`,
           `**Uptime:** ${fmtDuration(Date.now() - startedAt)}`,
-          `**Reconnects:** ${reconnects} (last: ${lastReconnectText})`,
+          `**Reconnects:** ${guildStats.reconnects} (last: ${lastReconnectText})`,
+          elsewhere.length ? `**Other servers:** ${elsewhere.join(', ')}` : '',
           `**Gateway:** ${Math.round(client.ws.ping)}ms`,
           `**Memory:** ${memory} MB · **Host load:** ${load}`,
-        ].join('\n'));
+        ].filter(Boolean).join('\n'));
       }
 
       case 'rejoin': {
-        await interaction.deferReply();
+        if (!channels[interaction.guildId]) {
+          return interaction.reply({
+            content: 'No voice channel is set here. Use `/move` first.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
 
-        await forceReconnect('owner used /rejoin');
+        await interaction.deferReply();
+        await forceReconnect(interaction.guildId, 'owner used /rejoin');
 
         return interaction.editReply(
-          `Reconnected to <#${channelId}>.`,
+          `Reconnected to <#${channels[interaction.guildId]}>.`,
         );
       }
 
@@ -1167,19 +1213,36 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.deferReply();
 
-        destroyCurrentConnection();
+        destroyConnection(interaction.guildId);
 
-        channelId = targetChannel.id;
+        channels[interaction.guildId] = targetChannel.id;
         saveState();
 
-        disconnectedSince = Date.now();
-        disconnectAlertSent = false;
+        const moveStats = statsFor(interaction.guildId);
+        moveStats.disconnectedSince = Date.now();
+        moveStats.alerted = false;
 
-        await connect({ force: true });
+        await connect(interaction.guildId, { force: true });
 
         return interaction.editReply(
           `Moved to <#${targetChannel.id}>`,
         );
+      }
+
+      case 'leave': {
+        if (!channels[interaction.guildId]) {
+          return interaction.reply({
+            content: 'I have no voice channel set here.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        destroyConnection(interaction.guildId);
+        delete channels[interaction.guildId];
+        voiceStats.delete(interaction.guildId);
+        saveState();
+
+        return interaction.reply('Left the voice channel here. Use `/move` to come back.');
       }
 
       case 'perms': {
@@ -1424,7 +1487,7 @@ client.once('clientReady', async () => {
     log(`command registration failed: ${error.message}`);
   });
 
-  await connect();
+  await connectAll();
 });
 
 process.on('unhandledRejection', (error) => {
