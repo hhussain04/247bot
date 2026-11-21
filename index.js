@@ -25,6 +25,7 @@ import {
 } from '@discordjs/voice';
 
 import * as football from './football.js';
+import casino from './casino/index.js';
 import * as mod from './moderation.js';
 
 // ---------- config ----------
@@ -1093,7 +1094,7 @@ async function registerCommands() {
     const body = guild.id === GUILD_ID ? allCommands : commands;
     await rest.put(
       Routes.applicationGuildCommands(APP_ID, guild.id),
-      { body },
+      { body: [...(body), ...casino.commands] },
     ).catch((error) => {
       log(`command registration failed in ${guild.id}: ${error.message}`);
     });
@@ -1102,6 +1103,7 @@ async function registerCommands() {
 }
 
 client.on('interactionCreate', async (interaction) => {
+  if (casino.handles(interaction)) return;
   // football runs first: it does its own permission checks, and it needs
   // button and modal interactions from ordinary members, which the two
   // guards below would otherwise discard
@@ -1498,4 +1500,5 @@ process.on('uncaughtException', (error) => {
   log(`uncaughtException: ${error?.message ?? error}`);
 });
 
+casino.setup(client);
 client.login(TOKEN);
