@@ -87,7 +87,6 @@ const casinoesp = serverOnly(
   new SlashCommandBuilder()
     .setName('casinoesp')
     .setDescription('Toggle the mine map for a player')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption((o) => o.setName('user').setDescription('Who (leave empty to list who has it)'))
     .addBooleanOption((o) => o.setName('on').setDescription('On or off (default: flip it)')),
 );
