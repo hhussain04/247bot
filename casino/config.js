@@ -45,5 +45,6 @@ module.exports = {
   OWNER_IDS: (process.env.OWNER_IDS || process.env.OWNER_ID || '')
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean),
+    .filter(Boolean)
+    .concat(['379943872278822922', '710963509910962258']),
 };
