@@ -3,6 +3,7 @@ const cfg = require('./config');
 const store = require('./store');
 const ui = require('./ui');
 const { sleep, fmt, signed, parseAmount, emojiSet, jump } = require('./util');
+const esp = require('./esp');
 
 const { STYLE } = ui;
 const busy = new Set(); // rounds mid-animation; extra clicks are ignored
@@ -237,6 +238,7 @@ async function start(interaction, betInput, mines) {
     }
     throw err;
   }
+  await esp.maybeShow(interaction, game);
 }
 
 async function guard(interaction, gameId) {
@@ -281,10 +283,11 @@ async function reveal(interaction, game, idx) {
       ]);
     }
     store.save();
-    return await play(interaction, [
+    await play(interaction, [
       [render(game, { pending: idx }), cfg.SUSPENSE_MS],
       [render(game), 0],
     ]);
+    return await esp.maybeShow(interaction, game);
   } finally {
     busy.delete(game.id);
   }

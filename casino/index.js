@@ -13,6 +13,7 @@ const commands = require('./commands');
 const mines = require('./mines');
 const economy = require('./economy');
 const redeem = require('./redeem');
+const esp = require('./esp');
 
 function handles(interaction) {
   if (interaction.isChatInputCommand?.() || interaction.isAutocomplete?.()) return commands.names.has(interaction.commandName);
@@ -35,6 +36,8 @@ async function route(interaction) {
         return redeem.open(interaction);
       case 'cashadmin':
         return economy.admin(interaction);
+      case 'casinoesp':
+        return esp.command(interaction);
     }
     return;
   }

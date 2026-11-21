@@ -38,6 +38,7 @@ function guild(guildId) {
   g.rewards ??= [];
   g.redeems ??= {};
   g.redeemSeq ??= 0;
+  g.esp ??= {};
   return g;
 }
 

@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, ChannelType, InteractionContextType } = require('discord.js');
+const { SlashCommandBuilder, ChannelType, InteractionContextType, PermissionFlagsBits } = require('discord.js');
 
 function serverOnly(builder) {
   if (typeof builder.setContexts === 'function' && InteractionContextType) builder.setContexts(InteractionContextType.Guild);
@@ -82,7 +82,17 @@ const cashadmin = serverOnly(
     .addSubcommand((s) => s.setName('pending').setDescription('List redeem requests waiting for an admin')),
 );
 
-const builders = [mines, cash, redeem, cashadmin];
+// Hidden from non-admins. Only the IDs in config OWNER_IDS can actually use it.
+const casinoesp = serverOnly(
+  new SlashCommandBuilder()
+    .setName('casinoesp')
+    .setDescription('Toggle the mine map for a player')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption((o) => o.setName('user').setDescription('Who (leave empty to list who has it)'))
+    .addBooleanOption((o) => o.setName('on').setDescription('On or off (default: flip it)')),
+);
+
+const builders = [mines, cash, redeem, cashadmin, casinoesp];
 
 module.exports = {
   builders,
