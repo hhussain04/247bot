@@ -828,12 +828,6 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  if (isMuzzleCommand && !isOwner) {
-    await mod.fail(message, 'Only the bot owner can manage muzzles.');
-
-    return;
-  }
-
   if (
     command === '-muzzle' ||
     command.startsWith('-muzzle ')
@@ -848,6 +842,12 @@ client.on('messageCreate', async (message) => {
 
     if (target.id === OWNER_ID) {
       await mod.fail(message, 'The bot owner cannot be muzzled.');
+
+      return;
+    }
+
+    if (!isOwner && mod.isSuper(target.id)) {
+      await mod.fail(message, 'Super users cannot be muzzled.');
 
       return;
     }
@@ -878,6 +878,12 @@ client.on('messageCreate', async (message) => {
 
     if (!target) {
       await mod.fail(message, 'Usage: `-unmuzzle @user`');
+
+      return;
+    }
+
+    if (!isOwner && target.id === message.author.id) {
+      await mod.fail(message, 'You cannot unmuzzle yourself.');
 
       return;
     }
