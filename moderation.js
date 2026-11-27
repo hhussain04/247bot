@@ -119,12 +119,25 @@ function guildState(guildId) {
 const own = (obj, key) => (obj && Object.hasOwn(obj, key) ? obj[key] : undefined);
 
 // ---------- access ----------
+// A perms entry is one of two shapes:
+//   { denied: [...] }   full access, minus the listed commands
+//   { allowed: [...] }  only the listed commands
+const isLimited = (entry) => Array.isArray(entry?.allowed);
+
 export function canUse(userId, guildId, command) {
   if (isSuper(userId)) return true;
   if (!guildId || SUPER_ONLY.has(command)) return false;
   const entry = own(own(state.guilds, guildId)?.perms, userId);
-  return Boolean(entry) && !(entry.denied ?? []).includes(command);
+  if (!entry) return false;
+  if (isLimited(entry)) return entry.allowed.includes(command);
+  return !(entry.denied ?? []).includes(command);
 }
+
+// True only when a limited user was given this exact command.
+const isAllowListed = (userId, guildId, command) => {
+  const entry = own(own(state.guilds, guildId)?.perms, userId);
+  return isLimited(entry) && entry.allowed.includes(command);
+};
 
 // Whitelisted users are ignored by the commands they're whitelisted from.
 export function isImmune(userId, guildId, command) {
@@ -773,6 +786,23 @@ async function sendGreeting(member, kind, invite) {
   await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
 }
 
+// ---------- perms helpers ----------
+const listCmds = (cmds) => cmds.map((c) => `\`-${c}\``).join(', ');
+
+// Reads every -command flag, e.g. `-perms -gif -snipe @user`.
+function parseFlags(message, args) {
+  const cmds = [];
+  for (const flag of args.filter((a) => a.startsWith('-'))) {
+    const cmd = resolveCommand(message.guildId, flag, { includeIndex: true });
+    if (!cmd) return { cmds, problem: `\`${flag}\` isn't a command.` };
+    if (SUPER_ONLY.has(cmd)) {
+      return { cmds, problem: `\`-${cmd}\` is for bot admins only, so it can't be handed out.` };
+    }
+    if (!cmds.includes(cmd)) cmds.push(cmd);
+  }
+  return { cmds, problem: null };
+}
+
 // ---------- commands ----------
 const HANDLERS = {
   setwelcomechannel: (m, a) => bindGreeting(m, a, 'welcome', 'set'),
@@ -1037,9 +1067,9 @@ const HANDLERS = {
         {
           name: 'Access (bot admins only)',
           value: [
-            '`-perms @user` give bot access in this server',
+            '`-perms @user` give full bot access in this server',
+            '`-perms -gif @user` give access to only `-gif` (list more: `-perms -gif -s @user`)',
             '`-perms` list who has access',
-            '`-perms -<command> @user` give back one command',
             '`-removeperm @user` take all access',
             '`-removeperm -<command> @user` take one command',
             '`-whitelist @user [commands]` make the bot ignore them (`-wl`)',
@@ -1388,40 +1418,54 @@ const HANDLERS = {
 
   async perms(message, args) {
     const gs = guildState(message.guildId);
-    const flag = args.find((a) => a.startsWith('-'));
     const userId = idFrom(args.find((a) => idFrom(a)));
 
     if (!userId) {
       const entries = Object.entries(gs.perms);
       if (!entries.length) return info(message, 'Nobody has bot access in this server yet.');
       return info(message, entries.map(([id, e]) => {
-        const denied = e.denied?.length
-          ? ` (blocked: ${e.denied.map((c) => `-${c}`).join(', ')})`
-          : '';
+        if (isLimited(e)) return `<@${id}> (only: ${listCmds(e.allowed)})`;
+        const denied = e.denied?.length ? ` (blocked: ${listCmds(e.denied)})` : '';
         return `<@${id}>${denied}`;
       }).join('\n'));
     }
 
     if (isSuper(userId)) return say(message, `<@${userId}> already has permanent access.`);
 
-    if (flag) {
-      const cmd = resolveCommand(message.guildId, flag, { includeIndex: true });
-      if (!cmd) return say(message, `\`${flag}\` isn't a command.`);
-      const entry = own(gs.perms, userId);
-      if (!entry) return say(message, `<@${userId}> has no bot access here. Run \`-perms @user\` first.`);
-      entry.denied = (entry.denied ?? []).filter((c) => c !== cmd);
+    const { cmds, problem } = parseFlags(message, args);
+    if (problem) return say(message, problem);
+
+    // No command named: full access, which also lifts any "only" limit.
+    if (!cmds.length) {
+      gs.perms[userId] = { denied: [] };
       save();
-      return ok(message, `<@${userId}> can use \`-${cmd}\` again.`);
+      return ok(message, `<@${userId}> now has full bot access in this server.`);
     }
 
-    gs.perms[userId] = { denied: [] };
+    const entry = own(gs.perms, userId);
+
+    // No access yet: give them just these commands.
+    if (!entry) {
+      gs.perms[userId] = { allowed: cmds };
+      save();
+      return ok(message, `<@${userId}> can now use ${listCmds(cmds)} only. ` +
+        'Run `-perms @user` to give full access.');
+    }
+
+    if (isLimited(entry)) {
+      entry.allowed = [...new Set([...entry.allowed, ...cmds])];
+      save();
+      return ok(message, `<@${userId}> can now use ${listCmds(entry.allowed)}.`);
+    }
+
+    // Full access already: un-block these commands.
+    entry.denied = (entry.denied ?? []).filter((c) => !cmds.includes(c));
     save();
-    return ok(message, `<@${userId}> now has full bot access in this server.`);
+    return ok(message, `<@${userId}> can use ${listCmds(cmds)} again.`);
   },
 
   async removeperm(message, args) {
     const gs = guildState(message.guildId);
-    const flag = args.find((a) => a.startsWith('-'));
     const userId = idFrom(args.find((a) => idFrom(a)));
     if (!userId) return say(message, 'Usage: `-removeperm @user` or `-removeperm -<command> @user`');
     if (isSuper(userId)) return say(message, `<@${userId}> has permanent access and can't be removed.`);
@@ -1429,17 +1473,30 @@ const HANDLERS = {
     const entry = own(gs.perms, userId);
     if (!entry) return say(message, `<@${userId}> has no bot access here.`);
 
-    if (flag) {
-      const cmd = resolveCommand(message.guildId, flag, { includeIndex: true });
-      if (!cmd) return say(message, `\`${flag}\` isn't a command.`);
-      entry.denied = [...new Set([...(entry.denied ?? []), cmd])];
+    const { cmds, problem } = parseFlags(message, args);
+    if (problem) return say(message, problem);
+
+    if (!cmds.length) {
+      delete gs.perms[userId];
       save();
-      return ok(message, `<@${userId}> can no longer use \`-${cmd}\`.`);
+      return ok(message, `<@${userId}> no longer has bot access here.`);
     }
 
-    delete gs.perms[userId];
+    if (isLimited(entry)) {
+      entry.allowed = entry.allowed.filter((c) => !cmds.includes(c));
+      if (!entry.allowed.length) {
+        delete gs.perms[userId];
+        save();
+        return ok(message, `<@${userId}> can no longer use ${listCmds(cmds)}, so they have no bot access left here.`);
+      }
+      save();
+      return ok(message, `<@${userId}> can no longer use ${listCmds(cmds)}. ` +
+        `They can still use ${listCmds(entry.allowed)}.`);
+    }
+
+    entry.denied = [...new Set([...(entry.denied ?? []), ...cmds])];
     save();
-    return ok(message, `<@${userId}> no longer has bot access here.`);
+    return ok(message, `<@${userId}> can no longer use ${listCmds(cmds)}.`);
   },
 };
 
@@ -1546,7 +1603,9 @@ export async function handleMessage(message) {
     ? null
     : own(guildState(message.guildId).phrases, head.toLowerCase());
   if (phrase) {
-    if (!canUse(message.author.id, message.guildId, 'say')) {
+    // -say covers every phrase; a limited user can also be given one phrase by name.
+    if (!canUse(message.author.id, message.guildId, 'say') &&
+      !isAllowListed(message.author.id, message.guildId, head.toLowerCase())) {
       await say(message, 'Not for you.');
       return true;
     }
